@@ -6,7 +6,7 @@ BabyMoon trasforma due smartphone in un baby monitor privato. Il dispositivo **B
 
 ## Stato del progetto
 
-**Versione:** `1.0.1`  
+**Versione:** `1.0.2`  
 **Runtime:** Node.js 20+ (Node.js 22 consigliato)  
 **Deploy di riferimento:** Render Web Service con HTTPS
 
@@ -38,6 +38,9 @@ BabyMoon trasforma due smartphone in un baby monitor privato. Il dispositivo **B
 - un solo initiator WebRTC: il dispositivo Baby;
 - protezione contro offerte concorrenti;
 - coda degli ICE candidate fino alla `remoteDescription`;
+- identificatore univoco per ogni negoziazione, così i candidati ICE di un tentativo precedente non contaminano quello successivo;
+- SDP inviato dopo una breve raccolta ICE: i candidati viaggiano sia nell'SDP sia tramite trickle ICE, evitando una dipendenza da un solo percorso di signaling;
+- timeout ICE esplicito con conteggio dei candidati locali/remoti e indicazione visibile dello stato TURN;
 - ricreazione pulita della `RTCPeerConnection` senza peer sovrapposti;
 - riconnessione automatica con backoff `0 s → 2 s → 5 s → 10 s → 30 s → 60 s`;
 - recupero su cambio rete, ritorno online e ritorno dell’app in primo piano, entro i limiti del browser mobile;
@@ -159,7 +162,7 @@ PUBLIC_URL=http://localhost:3000 npm start
 3. Collega `Condor555/BabyMoon` e seleziona `render.yaml`.
 4. Imposta `PUBLIC_URL` con l’URL HTTPS pubblico assegnato al servizio.
 5. Non configurare TURN finché non hai un server/servizio TURN; quando disponibile, aggiungi le tre variabili TURN come secret nella dashboard.
-6. Verifica `GET /api/health`, che deve restituire la versione `1.0.1`.
+6. Verifica `GET /api/health`, che deve restituire la versione `1.0.2`.
 
 Il Blueprint usa:
 
@@ -235,7 +238,7 @@ BabyMoon/
 ## Diagnostica
 
 - `/api/health`: stato e versione del servizio;
-- `/api/config`: ICE server pubblici forniti al client;
+- `/api/config`: ICE server pubblici forniti al client e flag `hasTurn` per la diagnostica;
 - overlay live: stato WebRTC, bitrate, candidato/protocollo e RTT quando esposti dal browser;
 - console browser: errori di autoplay, Wake Lock, `getStats`, signaling e media device;
 - log server: errori applicativi senza registrare audio/video.
@@ -243,14 +246,24 @@ BabyMoon/
 Se il Parent resta nero:
 
 1. verifica che sul Baby siano presenti sia la traccia video sia quella audio;
-2. controlla l’overlay `Video ricevuto / Audio ricevuto`;
-3. premi **Riprova ora**;
-4. prova con TURN se i dispositivi sono su reti diverse;
-5. su iOS tocca **Attiva audio** per soddisfare l’autoplay policy.
+2. controlla l’overlay: `Video/Audio negoziato` conferma solo lo scambio SDP, mentre `Video/Audio ricevuto` appare dopo la connessione ICE;
+3. controlla se la diagnostica mostra `TURN attivo` oppure `TURN non configurato`;
+4. premi **Riprova ora**;
+5. configura TURN se i dispositivi sono su reti diverse o la diagnostica resta su `WebRTC new`/`ICE checking`;
+6. su iOS tocca **Attiva audio** per soddisfare l’autoplay policy.
 
 ## Privacy
 
 BabyMoon non implementa registrazioni, screenshot, storico o upload media. I flussi audio/video viaggiano tramite WebRTC; il server conserva solo dati temporanei di sessione in memoria.
+
+## Release 1.0.2
+
+- fix del Parent fermo su `WebRTC new` con raccolta ICE ibrida (SDP completo + trickle ICE);
+- ogni negoziazione usa un ID univoco e ignora candidati ICE obsoleti durante i retry;
+- timer di connessione iniziale e diagnostica dei candidati locali/remoti;
+- stato `Video/Audio negoziato` distinto da media realmente ricevuto;
+- indicazione visibile `TURN attivo/non configurato` e messaggio esplicito quando la sola connessione diretta può non bastare;
+- cache PWA aggiornata e asset versionati per evitare che il deploy continui a usare il client 1.0.1.
 
 ## Release 1.0.1
 

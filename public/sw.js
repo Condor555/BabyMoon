@@ -1,5 +1,5 @@
-const CACHE = 'babymoon-v1.0.1';
-const APP_SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/manifest.webmanifest', '/icon.svg'];
+const CACHE = 'babymoon-v1.0.2';
+const APP_SHELL = ['/', '/index.html', '/styles.css?v=1.0.2', '/app.js?v=1.0.2', '/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting()));

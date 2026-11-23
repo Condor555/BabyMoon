@@ -99,6 +99,13 @@ function configuredIceServers() {
   return servers;
 }
 
+function hasTurnServer(servers) {
+  return servers.some((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some((url) => /^turns?:/i.test(String(url || '')));
+  });
+}
+
 function emitPresence(code, session) {
   io.to(code).emit('presence', { baby: Boolean(session.baby), parent: Boolean(session.parent) });
 }
@@ -167,6 +174,7 @@ function joinIsRateLimited(ip, code) {
 
 function validSignal(payload, role) {
   if (!payload || typeof payload !== 'object') return false;
+  if (!/^[A-Za-z0-9-]{16,64}$/.test(String(payload.negotiationId || ''))) return false;
   if (payload.description) {
     const { type, sdp } = payload.description;
     const expectedType = role === 'baby' ? 'offer' : 'answer';
@@ -218,12 +226,13 @@ app.post('/api/session', async (req, res) => {
 
 app.get('/api/health', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ ok: true, service: 'BabyMoon', version: '1.0.1' });
+  res.json({ ok: true, service: 'BabyMoon', version: '1.0.2' });
 });
 
 app.get('/api/config', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.json({ iceServers: configuredIceServers() });
+  const iceServers = configuredIceServers();
+  res.json({ iceServers, hasTurn: hasTurnServer(iceServers) });
 });
 
 app.post('/api/session/:code/end', (req, res) => {
@@ -366,4 +375,4 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: 'Errore interno del server.' });
 });
 
-server.listen(PORT, () => console.log(`BabyMoon v1.0.1 http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`BabyMoon v1.0.2 http://localhost:${PORT}`));

@@ -41,6 +41,11 @@ test('client contract covers audio/video, autoplay fallback and clean WebRTC ret
   assert.match(code, /closePeer\(\);[\s\S]*createAndSendOffer\(\{ restart: true \}\)/);
   assert.match(code, /session-ended/);
   assert.match(code, /if \(!state\.mode \|\| state\.ending/);
+  assert.match(code, /waitForIceGathering\(peer\)/);
+  assert.match(code, /negotiationId/);
+  assert.match(code, /candidate\.toJSON/);
+  assert.match(code, /Timeout ICE/);
+  assert.match(code, /Non è configurato un server TURN/);
 });
 
 test('client contract covers mobile lifecycle, Wake Lock and getStats watchdog', async () => {

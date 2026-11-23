@@ -38,17 +38,30 @@ const state = {
   lastMediaBytes: 0,
   lastMediaProgressAt: 0,
   lastStatsAt: 0,
+  hasTurn: false,
+  connectionTimer: null,
+  negotiationId: null,
+  localCandidateTypes: new Set(),
+  remoteCandidateCount: 0,
 };
 
 const runtimeConfigReady = fetch('/api/config', { cache: 'no-store' })
   .then((response) => (response.ok ? response.json() : null))
   .then((config) => {
     if (Array.isArray(config?.iceServers) && config.iceServers.length) state.iceServers = config.iceServers;
+    state.hasTurn = Boolean(config?.hasTurn);
   })
   .catch((error) => console.warn('Configurazione ICE non disponibile, uso STUN predefinito:', error));
 
 const $ = (selector) => document.querySelector(selector);
 const cleanCode = (value) => String(value || '').replace(/\D/g, '').slice(0, 6);
+const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (character) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;',
+}[character]));
 
 function render(html, className = 'app') {
   app.className = className;
@@ -58,8 +71,10 @@ function render(html, className = 'app') {
 function clearRetryTimers() {
   clearTimeout(state.retryTimer);
   clearTimeout(state.disconnectTimer);
+  clearTimeout(state.connectionTimer);
   state.retryTimer = null;
   state.disconnectTimer = null;
+  state.connectionTimer = null;
   state.retryInFlight = false;
 }
 
@@ -163,10 +178,15 @@ function clearRemoteMedia() {
 
 function closePeer({ clearRemote = true } = {}) {
   stopStatsWatchdog();
+  clearTimeout(state.connectionTimer);
+  state.connectionTimer = null;
   const peer = state.pc;
   state.pc = null;
   state.pendingCandidates = [];
   state.makingOffer = false;
+  state.negotiationId = null;
+  state.localCandidateTypes = new Set();
+  state.remoteCandidateCount = 0;
   if (peer) {
     peer.ontrack = null;
     peer.onicecandidate = null;
@@ -175,6 +195,57 @@ function closePeer({ clearRemote = true } = {}) {
     peer.close();
   }
   if (clearRemote) clearRemoteMedia();
+}
+
+function newNegotiationId() {
+  if (crypto?.randomUUID) return crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+function candidateType(candidateLine = '') {
+  return String(candidateLine).match(/\btyp\s+(host|srflx|prflx|relay)\b/i)?.[1]?.toLowerCase() || 'unknown';
+}
+
+function connectivityDetail(reason) {
+  const directOnly = !state.hasTurn
+    ? ' Non è configurato un server TURN: se i telefoni sono su reti diverse o dietro NAT restrittivi, la connessione diretta può non essere possibile.'
+    : '';
+  return `${reason}.${directOnly}`;
+}
+
+function startConnectionDeadline(peer, negotiationId) {
+  clearTimeout(state.connectionTimer);
+  state.connectionTimer = setTimeout(() => {
+    if (
+      state.pc !== peer
+      || state.negotiationId !== negotiationId
+      || state.ending
+      || peer.connectionState === 'connected'
+    ) return;
+    const local = [...state.localCandidateTypes].join(', ') || 'nessuno';
+    scheduleReconnect(`Timeout ICE: candidati locali ${local}, candidati remoti ${state.remoteCandidateCount}`);
+  }, 18_000);
+}
+
+async function waitForIceGathering(peer, timeout = 3_000) {
+  if (peer.iceGatheringState === 'complete') return;
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      peer.removeEventListener('icegatheringstatechange', onStateChange);
+      resolve();
+    };
+    const onStateChange = () => {
+      if (peer.iceGatheringState === 'complete' || peer.connectionState === 'closed') finish();
+    };
+    const timer = setTimeout(finish, timeout);
+    peer.addEventListener('icegatheringstatechange', onStateChange);
+  });
 }
 
 function resetSession({ clearUrl = true, forgetParentToken = true } = {}) {
@@ -375,13 +446,27 @@ async function joinParent(code, source) {
 
 function createPeer() {
   closePeer();
-  const peer = new RTCPeerConnection({ iceServers: state.iceServers });
+  const peer = new RTCPeerConnection({
+    iceServers: state.iceServers,
+    iceCandidatePoolSize: 4,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+  });
   state.pc = peer;
 
   peer.onicecandidate = ({ candidate }) => {
     if (candidate && state.pc === peer && state.joined) {
-      socket.emit('signal', { candidate });
+      const serialized = candidate.toJSON ? candidate.toJSON() : candidate;
+      state.localCandidateTypes.add(candidateType(serialized.candidate));
+      socket.emit('signal', { candidate: serialized, negotiationId: state.negotiationId });
     }
+  };
+
+  peer.onicecandidateerror = (event) => {
+    if (state.pc !== peer || state.ending) return;
+    const target = event.url ? ` (${event.url})` : '';
+    console.warn(`Errore ICE ${event.errorCode || ''}${target}: ${event.errorText || 'errore sconosciuto'}`);
+    updateDiagnostics(`ICE: ${event.errorText || 'server STUN/TURN non raggiungibile'}`);
   };
 
   peer.onconnectionstatechange = () => {
@@ -392,7 +477,11 @@ function createPeer() {
       clearRetryTimers();
       startStatsWatchdog(peer);
       if (state.mode === 'baby') babyLive();
-      else updateParentStatus('🟢 LIVE', 'connected');
+      else {
+        updateParentStatus('🟢 LIVE', 'connected');
+        updateTrackStatus();
+        showParentStream();
+      }
       return;
     }
     if (connectionState === 'disconnected') {
@@ -406,6 +495,7 @@ function createPeer() {
 
   peer.oniceconnectionstatechange = () => {
     if (state.pc !== peer || state.ending) return;
+    updateDiagnostics(`WebRTC ${peer.connectionState} · ICE ${peer.iceConnectionState}`);
     if (peer.iceConnectionState === 'failed') scheduleReconnect('Negoziazione di rete fallita');
   };
 
@@ -438,11 +528,18 @@ async function createAndSendOffer({ restart = false } = {}) {
 
   state.makingOffer = true;
   try {
+    const negotiationId = newNegotiationId();
+    state.negotiationId = negotiationId;
     const offer = await peer.createOffer({ iceRestart: restart });
     if (state.pc !== peer) return;
     await peer.setLocalDescription(offer);
-    const response = await emitWithAck('signal', { description: peer.localDescription });
+    // Include gathered candidates in the SDP as a fallback to trickle ICE. This is
+    // deliberately bounded so mobile users do not wait indefinitely for TURN/STUN.
+    await waitForIceGathering(peer);
+    if (state.pc !== peer || state.negotiationId !== negotiationId) return;
+    const response = await emitWithAck('signal', { description: peer.localDescription, negotiationId });
     if (!response.ok) throw new Error(response.error || 'Invio offerta WebRTC non riuscito.');
+    startConnectionDeadline(peer, negotiationId);
     babyLive('Connessione al Parent…');
   } catch (error) {
     console.error(error);
@@ -452,33 +549,40 @@ async function createAndSendOffer({ restart = false } = {}) {
   }
 }
 
-async function handleDescription(description) {
+async function handleDescription(description, negotiationId) {
   if (!description || state.ending) return;
 
   if (state.mode === 'parent' && description.type === 'offer') {
     if (state.pc && state.pc.signalingState !== 'stable') closePeer();
     const peer = ensurePeer();
+    state.negotiationId = negotiationId;
     await peer.setRemoteDescription(description);
     await flushCandidates(peer);
     const answer = await peer.createAnswer();
     await peer.setLocalDescription(answer);
-    const response = await emitWithAck('signal', { description: peer.localDescription });
+    await waitForIceGathering(peer);
+    if (state.pc !== peer || state.negotiationId !== negotiationId) return;
+    const response = await emitWithAck('signal', { description: peer.localDescription, negotiationId });
     if (!response.ok) throw new Error(response.error || 'Invio risposta WebRTC non riuscito.');
+    startConnectionDeadline(peer, negotiationId);
     return;
   }
 
   if (state.mode === 'baby' && description.type === 'answer') {
+    if (!negotiationId || negotiationId !== state.negotiationId) return;
     const peer = ensurePeer();
     await peer.setRemoteDescription(description);
     await flushCandidates(peer);
   }
 }
 
-async function handleCandidate(candidate) {
+async function handleCandidate(candidate, negotiationId) {
   if (!candidate || state.ending) return;
+  if (state.negotiationId && negotiationId && state.negotiationId !== negotiationId) return;
   const peer = ensurePeer();
+  state.remoteCandidateCount += 1;
   if (!peer.remoteDescription) {
-    state.pendingCandidates.push(candidate);
+    state.pendingCandidates.push({ candidate, negotiationId });
     return;
   }
   await peer.addIceCandidate(candidate);
@@ -486,9 +590,10 @@ async function handleCandidate(candidate) {
 
 async function flushCandidates(peer) {
   const queued = state.pendingCandidates.splice(0);
-  for (const candidate of queued) {
+  for (const item of queued) {
     if (state.pc !== peer) return;
-    await peer.addIceCandidate(candidate);
+    if (item.negotiationId && state.negotiationId && item.negotiationId !== state.negotiationId) continue;
+    await peer.addIceCandidate(item.candidate);
   }
 }
 
@@ -518,7 +623,7 @@ function babyLive(status = 'Parent collegato') {
       <video id="local-video" autoplay muted playsinline webkit-playsinline></video>
       <div class="head"><b>🟢 BabyMoon</b><span id="connection-label">${status}</span></div>
       <div class="track-status">🎥 Video attivo · 🎙️ Microfono attivo</div>
-      <div class="diagnostics" id="diagnostics">WebRTC: ${state.pc?.connectionState || 'connessione'}</div>
+      <div class="diagnostics" id="diagnostics">WebRTC: ${state.pc?.connectionState || 'connessione'} · TURN ${state.hasTurn ? 'attivo' : 'non configurato'}</div>
       <div class="controls">
         <button class="control" data-action="switch-camera">🔄 Camera</button>
         <button class="control" data-action="dark-screen">🌙 Oscura</button>
@@ -605,8 +710,8 @@ function parentMonitorView() {
     <section class="video-stage">
       <video id="remote-video" autoplay playsinline webkit-playsinline></video>
       <div class="head"><b>BabyMoon</b><span id="parent-status">🟡 Connessione…</span></div>
-      <div class="track-status" id="track-status">🎥 ${hasVideo ? 'Video ricevuto' : 'Video in attesa'} · 🎙️ ${hasAudio ? 'Audio ricevuto' : 'Audio in attesa'}</div>
-      <div class="diagnostics" id="diagnostics">WebRTC: ${state.pc?.connectionState || 'connessione'}</div>
+       <div class="track-status" id="track-status">🎥 ${hasVideo ? 'Video negoziato' : 'Video in attesa'} · 🎙️ ${hasAudio ? 'Audio negoziato' : 'Audio in attesa'}</div>
+      <div class="diagnostics" id="diagnostics">WebRTC: ${state.pc?.connectionState || 'connessione'} · TURN ${state.hasTurn ? 'attivo' : 'non configurato'}</div>
       <div class="play-gate hidden" id="play-gate">
         <button class="primary compact" data-action="activate-audio">▶ Avvia video e audio</button>
       </div>
@@ -632,7 +737,8 @@ async function showParentStream() {
   updateTrackStatus();
   try {
     await video.play();
-    updateParentStatus('🟢 LIVE', 'connected');
+    if (state.pc?.connectionState === 'connected') updateParentStatus('🟢 LIVE', 'connected');
+    else updateParentStatus('🟡 Collegamento ICE…', 'waiting');
     $('#play-gate')?.classList.add('hidden');
   } catch (error) {
     console.warn('Riproduzione automatica bloccata:', error);
@@ -682,7 +788,8 @@ function updateTrackStatus() {
   if (!label) return;
   const videoTracks = state.remoteStream?.getVideoTracks().filter((track) => track.readyState === 'live') || [];
   const audioTracks = state.remoteStream?.getAudioTracks().filter((track) => track.readyState === 'live') || [];
-  label.textContent = `🎥 ${videoTracks.length ? 'Video ricevuto' : 'Video in attesa'} · 🎙️ ${audioTracks.length ? 'Audio ricevuto' : 'Audio in attesa'}`;
+  const connected = state.pc?.connectionState === 'connected';
+  label.textContent = `🎥 ${videoTracks.length ? (connected ? 'Video ricevuto' : 'Video negoziato') : 'Video in attesa'} · 🎙️ ${audioTracks.length ? (connected ? 'Audio ricevuto' : 'Audio negoziato') : 'Audio in attesa'}`;
 }
 
 function updateParentStatus(text, className = '') {
@@ -697,11 +804,12 @@ function updateConnectionStatus(message) {
   if (label) label.textContent = message;
 }
 
-function connectingView(message, attempt = 0) {
+function connectingView(message, attempt = 0, detail = '') {
   render(`
     <div class="spinner"></div>
     <h2 class="center">${message}</h2>
     ${attempt ? `<p class="lead center">Tentativo ${attempt} di ${RETRY_DELAYS.length}</p>` : ''}
+    ${detail ? `<div class="notice connection-help" role="status">${escapeHtml(detail)}</div>` : ''}
     <button class="primary" data-action="retry">Riprova ora</button>
     <button class="secondary" data-action="end-session">Termina sessione</button>
   `);
@@ -731,7 +839,7 @@ function scheduleReconnect(reason) {
   const index = state.retryAttempt;
   state.retryAttempt += 1;
   const delay = RETRY_DELAYS[index];
-  connectingView('Tentativo di riconnessione…', state.retryAttempt);
+  connectingView('Tentativo di riconnessione…', state.retryAttempt, connectivityDetail(reason));
   state.retryTimer = setTimeout(async () => {
     state.retryTimer = null;
     state.retryInFlight = true;
@@ -848,8 +956,8 @@ socket.on('retry-request', () => {
 socket.on('signal', async ({ payload } = {}) => {
   if (!state.mode || state.ending || !payload) return;
   try {
-    if (payload.description) await handleDescription(payload.description);
-    else if (payload.candidate) await handleCandidate(payload.candidate);
+    if (payload.description) await handleDescription(payload.description, payload.negotiationId);
+    else if (payload.candidate) await handleCandidate(payload.candidate, payload.negotiationId);
   } catch (error) {
     console.error(error);
     scheduleReconnect(error.message);

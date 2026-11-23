@@ -126,7 +126,7 @@ class SocketIoPollingClient {
   }
 }
 
-test('BabyMoon V1.0.1 server, pairing, signaling, termination and limits', async (t) => {
+test('BabyMoon V1.0.2 server, pairing, signaling, termination and limits', async (t) => {
   const port = 41_000 + Math.floor(Math.random() * 2_000);
   const baseUrl = `http://127.0.0.1:${port}`;
   const server = spawn(process.execPath, ['server.js'], {
@@ -147,7 +147,7 @@ test('BabyMoon V1.0.1 server, pairing, signaling, termination and limits', async
   t.after(() => server.kill('SIGTERM'));
 
   const health = await waitForHealth(baseUrl);
-  assert.deepEqual(health, { ok: true, service: 'BabyMoon', version: '1.0.1' });
+  assert.deepEqual(health, { ok: true, service: 'BabyMoon', version: '1.0.2' });
 
   const home = await fetch(baseUrl);
   assert.equal(home.status, 200);
@@ -157,6 +157,7 @@ test('BabyMoon V1.0.1 server, pairing, signaling, termination and limits', async
   const config = await fetch(`${baseUrl}/api/config`).then((response) => response.json());
   assert.equal(config.iceServers.length, 3);
   assert.equal(config.iceServers[2].username, 'temporary-user');
+  assert.equal(config.hasTurn, true);
 
   // PIN pairing path.
   const pinSession = await createSession(baseUrl);
@@ -176,13 +177,21 @@ test('BabyMoon V1.0.1 server, pairing, signaling, termination and limits', async
   assert.match(parentJoin.participantToken, /^[a-f0-9]{64}$/);
   await baby.waitForEvent('parent-ready');
 
-  const offer = { description: { type: 'offer', sdp: 'v=0\r\n' } };
+  const negotiationId = '12345678-1234-4234-9234-123456789abc';
+  const offer = { description: { type: 'offer', sdp: 'v=0\r\n' }, negotiationId };
   assert.equal((await baby.emitAck('signal', offer)).ok, true);
   assert.deepEqual(await parent.waitForEvent('signal'), { payload: offer });
 
-  const answer = { description: { type: 'answer', sdp: 'v=0\r\n' } };
+  const answer = { description: { type: 'answer', sdp: 'v=0\r\n' }, negotiationId };
   assert.equal((await parent.emitAck('signal', answer)).ok, true);
   assert.deepEqual(await baby.waitForEvent('signal'), { payload: answer });
+
+  const candidate = {
+    candidate: { candidate: 'candidate:1 1 udp 2122260223 192.0.2.1 50000 typ host', sdpMid: '0', sdpMLineIndex: 0 },
+    negotiationId,
+  };
+  assert.equal((await baby.emitAck('signal', candidate)).ok, true);
+  assert.deepEqual(await parent.waitForEvent('signal'), { payload: candidate });
 
   assert.equal((await parent.emitAck('request-reconnect')).ok, true);
   await baby.waitForEvent('retry-request');
