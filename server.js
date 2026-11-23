@@ -1,436 +1,212 @@
 'use strict';
 
-const crypto = require('node:crypto');
-const http = require('node:http');
-const path = require('node:path');
+const path = require('path');
+const crypto = require('crypto');
+const http = require('http');
 const express = require('express');
 const helmet = require('helmet');
 const QRCode = require('qrcode');
 const { Server } = require('socket.io');
+const { getIceServers, normalizeSettings } = require('./lib/config');
 
-const PAIRING_TTL_MS = 5 * 60 * 1000;
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
-const DISCONNECTED_SESSION_TTL_MS = 10 * 60 * 1000;
-const MAX_PAIRING_ATTEMPTS = 5;
-const ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
-const ROLES = new Set(['baby', 'parent']);
-const SIGNAL_TYPES = new Set(['offer', 'answer', 'ice-candidate', 'end-of-candidates']);
+const PORT = Number(process.env.PORT || 3000);
+const PUBLIC_URL = String(process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const SESSION_TTL_MS = 5 * 60 * 60 * 1000;
+const PAIR_TTL_MS = 5 * 60 * 1000;
+const MAX_ATTEMPTS = 5;
+const MAX_SIGNAL_BYTES = 96 * 1024;
 
-function token(bytes = 32) {
-  return crypto.randomBytes(bytes).toString('base64url');
-}
-
-function normalizePin(value) {
-  return String(value ?? '').replace(/\D/g, '').slice(0, 6);
-}
-
-function safeOrigin(socket, configuredOrigin) {
-  if (configuredOrigin) return configuredOrigin.replace(/\/$/, '');
-  const forwardedProto = String(socket.handshake.headers['x-forwarded-proto'] || '').split(',')[0];
-  const protocol = forwardedProto || (socket.handshake.secure ? 'https' : 'http');
-  const host = socket.handshake.headers['x-forwarded-host'] || socket.handshake.headers.host;
-  return `${protocol}://${host}`;
-}
-
-function parseIceServers(env = process.env) {
-  const iceServers = [
-    { urls: ['stun:stun.cloudflare.com:3478'] },
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
-  ];
-
-  const urls = String(env.TURN_URLS || '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
-  if (urls.length && env.TURN_USERNAME && env.TURN_CREDENTIAL) {
-    iceServers.push({
-      urls,
-      username: String(env.TURN_USERNAME),
-      credential: String(env.TURN_CREDENTIAL)
-    });
+const app = express();
+app.set('trust proxy', 1);
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", 'data:'],
+      connectSrc: ["'self'", 'ws:', 'wss:'],
+      mediaSrc: ["'self'", 'blob:'],
+      workerSrc: ["'self'", 'blob:'],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      frameAncestors: ["'none'"]
+    }
+  },
+  crossOriginEmbedderPolicy: false
+}));
+app.use(express.json({ limit: '32kb' }));
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag: true,
+  maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0,
+  setHeaders(res, file) {
+    if (file.endsWith('sw.js') || file.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
   }
+}));
 
-  return iceServers;
+app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'BabyMoon', version: '1.1.0' }));
+app.get('/api/config', (_req, res) => res.json({ version: '1.1.0', iceServers: getIceServers(), turnConfigured: Boolean(process.env.TURN_URLS) }));
+app.get('/*splat', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  maxHttpBufferSize: MAX_SIGNAL_BYTES,
+  pingInterval: 10000,
+  pingTimeout: 20000,
+  cors: { origin: false }
+});
+
+const sessions = new Map();
+const attempts = new Map();
+
+function randomToken() { return crypto.randomBytes(32).toString('base64url'); }
+function pin() { return String(crypto.randomInt(0, 1000000)).padStart(6, '0'); }
+function id() { return crypto.randomUUID(); }
+function safeAck(ack, payload) { if (typeof ack === 'function') ack(payload); }
+function publicSession(session) {
+  return { sessionId: session.id, pin: session.pin, pairToken: session.pairToken, expiresAt: session.pairExpiresAt, iceServers: getIceServers() };
+}
+function authorize(socket, sessionId, role) {
+  const session = sessions.get(sessionId);
+  if (!session || session.ended || socket.data.sessionId !== sessionId || socket.data.role !== role) return null;
+  const side = session[role];
+  if (!side || side.socketId !== socket.id) return null;
+  return session;
+}
+function bind(socket, session, role, token) {
+  socket.data.sessionId = session.id;
+  socket.data.role = role;
+  socket.data.token = token;
+  session[role].socketId = socket.id;
+  session[role].connectedAt = Date.now();
+  socket.join(session.id);
+}
+function finishSession(session, reason = 'terminated') {
+  if (!session || session.ended) return;
+  session.ended = true;
+  io.to(session.id).emit('session-ended', { reason });
+  io.in(session.id).socketsLeave(session.id);
+  setTimeout(() => sessions.delete(session.id), 1000);
+}
+function attemptKey(socket, value) { return `${socket.handshake.address}:${String(value || '').slice(0, 64)}`; }
+function canAttempt(socket, value) {
+  const key = attemptKey(socket, value);
+  const record = attempts.get(key) || { count: 0, resetAt: Date.now() + 10 * 60 * 1000 };
+  if (record.resetAt < Date.now()) { record.count = 0; record.resetAt = Date.now() + 10 * 60 * 1000; }
+  record.count += 1;
+  attempts.set(key, record);
+  return record.count <= MAX_ATTEMPTS;
+}
+function findSession({ pin: requestedPin, pairToken }) {
+  const now = Date.now();
+  for (const session of sessions.values()) {
+    if (session.ended || session.parent) continue;
+    if (pairToken && session.pairToken === pairToken && session.pairExpiresAt > now) return session;
+    if (requestedPin && session.pin === requestedPin && session.pairExpiresAt > now) return session;
+  }
+  return null;
 }
 
-function createBabyMoonServer(options = {}) {
-  const env = options.env || process.env;
-  const logger = options.logger || console;
-  const app = express();
-  const server = http.createServer(app);
-  const io = new Server(server, {
-    transports: ['websocket', 'polling'],
-    pingInterval: 20_000,
-    pingTimeout: 20_000,
-    maxHttpBufferSize: 128 * 1024,
-    cors: false
-  });
-
-  const sessions = new Map();
-  const attempts = new Map();
-  const publicDir = path.join(__dirname, 'public');
-  const publicUrl = String(env.PUBLIC_URL || '').trim();
-  const iceServers = parseIceServers(env);
-  const turnConfigured = iceServers.some((entry) => {
-    const urls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
-    return urls.some((url) => String(url).startsWith('turn:') || String(url).startsWith('turns:'));
-  });
-
-  app.set('trust proxy', 1);
-  app.use((req, res, next) => {
-    if (env.NODE_ENV === 'production' && req.headers['x-forwarded-proto'] === 'http') {
-      return res.redirect(308, `https://${req.headers.host}${req.originalUrl}`);
-    }
-    return next();
-  });
-  app.use(helmet({
-    crossOriginEmbedderPolicy: false,
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'"],
-        imgSrc: ["'self'", 'data:', 'blob:'],
-        mediaSrc: ["'self'", 'blob:'],
-        connectSrc: ["'self'", 'ws:', 'wss:'],
-        workerSrc: ["'self'", 'blob:'],
-        manifestSrc: ["'self'"],
-        objectSrc: ["'none'"],
-        frameAncestors: ["'none'"],
-        baseUri: ["'self'"],
-        formAction: ["'self'"]
-      }
-    },
-    referrerPolicy: { policy: 'no-referrer' }
-  }));
-  app.use(express.json({ limit: '16kb' }));
-
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, name: 'BabyMoon', version: '1.0.4' });
-  });
-
-  app.get('/api/ice-config', (_req, res) => {
-    res.set('Cache-Control', 'no-store');
-    res.json({
-      iceServers,
-      turnConfigured,
-      iceTransportPolicy: 'all'
-    });
-  });
-
-  app.use(express.static(publicDir, {
-    etag: true,
-    setHeaders(res, filePath) {
-      if (filePath.endsWith('sw.js') || filePath.endsWith('index.html')) {
-        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-      } else {
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-      }
-    }
-  }));
-  // Express 5 requires a named wildcard.
-  app.get('/*splat', (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
-
-  function publicSession(session) {
-    return {
-      sessionId: session.id,
-      role: undefined,
-      expiresAt: session.expiresAt,
-      turnConfigured
+io.on('connection', socket => {
+  socket.on('create-session', async (_payload, ack) => {
+    if (socket.data.sessionId) return safeAck(ack, { ok: false, error: 'already-bound' });
+    const session = {
+      id: id(), pin: pin(), pairToken: randomToken(), pairExpiresAt: Date.now() + PAIR_TTL_MS,
+      createdAt: Date.now(), ended: false, settings: normalizeSettings(),
+      baby: { token: randomToken(), socketId: null }, parent: null, lastDetectionAt: { cry: 0, motion: 0 }
     };
-  }
+    sessions.set(session.id, session);
+    bind(socket, session, 'baby', session.baby.token);
+    const pairUrl = `${PUBLIC_URL}/?pair=${encodeURIComponent(session.pairToken)}`;
+    let qrDataUrl = '';
+    try { qrDataUrl = await QRCode.toDataURL(pairUrl, { margin: 1, width: 280, color: { dark: '#0b1020', light: '#ffffff' } }); } catch (_) {}
+    safeAck(ack, { ok: true, ...publicSession(session), token: session.baby.token, pairUrl, qrDataUrl });
+  });
 
-  function getPeerSocket(session, role) {
-    const id = role === 'baby' ? session.parentSocketId : session.babySocketId;
-    return id ? io.sockets.sockets.get(id) : null;
-  }
-
-  function emitPresence(session) {
-    const payload = {
-      baby: Boolean(session.babySocketId && io.sockets.sockets.has(session.babySocketId)),
-      parent: Boolean(session.parentSocketId && io.sockets.sockets.has(session.parentSocketId)),
-      paired: session.paired
-    };
-    io.to(session.id).emit('presence', payload);
-    if (payload.baby && payload.parent) {
-      io.to(session.babySocketId).emit('peer-ready', { role: 'parent' });
-      io.to(session.parentSocketId).emit('peer-ready', { role: 'baby' });
-    }
-  }
-
-  function leaveCurrentSession(socket) {
-    const { sessionId, role } = socket.data;
-    if (!sessionId || !ROLES.has(role)) return;
-    const session = sessions.get(sessionId);
-    if (!session) return;
-    if (role === 'baby' && session.babySocketId === socket.id) session.babySocketId = null;
-    if (role === 'parent' && session.parentSocketId === socket.id) session.parentSocketId = null;
-    socket.leave(sessionId);
-    socket.data.sessionId = null;
-    socket.data.role = null;
-    session.lastDisconnectedAt = Date.now();
-    const peer = getPeerSocket(session, role);
-    peer?.emit('peer-disconnected', { role });
-    emitPresence(session);
-  }
-
-  function authorizeSocket(socket) {
-    const { sessionId, role } = socket.data;
-    if (!sessionId || !ROLES.has(role)) return null;
-    const session = sessions.get(sessionId);
-    if (!session || session.ended) return null;
-    const expected = role === 'baby' ? session.babySocketId : session.parentSocketId;
-    return expected === socket.id ? session : null;
-  }
-
-  function bindSocketToSession(socket, session, role) {
-    leaveCurrentSession(socket);
-    const key = role === 'baby' ? 'babySocketId' : 'parentSocketId';
-    const previousId = session[key];
-    if (previousId && previousId !== socket.id) {
-      const previousSocket = io.sockets.sockets.get(previousId);
-      previousSocket?.emit('session-replaced');
-      previousSocket?.leave(session.id);
-    }
-    session[key] = socket.id;
-    session.lastSeenAt = Date.now();
-    socket.data.sessionId = session.id;
-    socket.data.role = role;
-    socket.join(session.id);
-  }
-
-  function attemptKey(socket, sessionId) {
-    return `${socket.handshake.address}|${sessionId || 'unknown'}`;
-  }
-
-  function isRateLimited(socket, sessionId) {
-    const key = attemptKey(socket, sessionId);
-    const now = Date.now();
-    const recent = (attempts.get(key) || []).filter((value) => now - value < ATTEMPT_WINDOW_MS);
-    attempts.set(key, recent);
-    return recent.length >= MAX_PAIRING_ATTEMPTS;
-  }
-
-  function recordFailedAttempt(socket, sessionId) {
-    const key = attemptKey(socket, sessionId);
-    const recent = attempts.get(key) || [];
-    recent.push(Date.now());
-    attempts.set(key, recent);
-  }
-
-  function clearAttempts(socket, sessionId) {
-    attempts.delete(attemptKey(socket, sessionId));
-  }
-
-  function findSessionByPin(pin) {
-    for (const session of sessions.values()) {
-      if (!session.ended && !session.paired && session.pin === pin) return session;
-    }
-    return null;
-  }
-
-  function endSession(session, reason = 'ended') {
-    if (!session || session.ended) return;
-    session.ended = true;
+  socket.on('join-session', (payload = {}, ack) => {
+    const requestedPin = String(payload.pin || '').replace(/\D/g, '').slice(0, 6);
+    const pairToken = String(payload.pairToken || '').slice(0, 128);
+    if (!canAttempt(socket, requestedPin || pairToken)) return safeAck(ack, { ok: false, error: 'too-many-attempts' });
+    const session = findSession({ pin: requestedPin, pairToken });
+    if (!session) return safeAck(ack, { ok: false, error: 'session-not-found' });
+    if (session.parent) return safeAck(ack, { ok: false, error: 'parent-already-connected' });
+    session.parent = { token: randomToken(), socketId: null };
     session.pin = null;
-    session.pairingToken = null;
-    io.to(session.id).emit('session-ended', { reason });
-    for (const socketId of [session.babySocketId, session.parentSocketId]) {
-      const member = socketId ? io.sockets.sockets.get(socketId) : null;
-      if (member) {
-        member.data.sessionId = null;
-        member.data.role = null;
-        member.leave(session.id);
-      }
-    }
-    sessions.delete(session.id);
-  }
-
-  io.on('connection', (socket) => {
-    socket.data.sessionId = null;
-    socket.data.role = null;
-
-    socket.on('create-session', async (_payload, ack = () => {}) => {
-      try {
-        const session = {
-          id: token(16),
-          pin: String(crypto.randomInt(100000, 1_000_000)),
-          pairingToken: token(32),
-          babyToken: token(32),
-          parentToken: token(32),
-          babySocketId: null,
-          parentSocketId: null,
-          paired: false,
-          ended: false,
-          createdAt: Date.now(),
-          expiresAt: Date.now() + SESSION_TTL_MS,
-          pairingExpiresAt: Date.now() + PAIRING_TTL_MS,
-          lastSeenAt: Date.now(),
-          lastDisconnectedAt: null
-        };
-        sessions.set(session.id, session);
-        bindSocketToSession(socket, session, 'baby');
-        const origin = safeOrigin(socket, publicUrl);
-        const joinUrl = `${origin}/?join=${encodeURIComponent(session.id)}&token=${encodeURIComponent(session.pairingToken)}`;
-        const qrDataUrl = await QRCode.toDataURL(joinUrl, {
-          errorCorrectionLevel: 'M',
-          margin: 1,
-          width: 512,
-          color: { dark: '#07111f', light: '#ffffff' }
-        });
-        ack({
-          ok: true,
-          ...publicSession(session),
-          role: 'baby',
-          pin: session.pin,
-          resumeToken: session.babyToken,
-          joinUrl,
-          qrDataUrl
-        });
-        emitPresence(session);
-      } catch (error) {
-        logger.error('create-session failed', error);
-        ack({ ok: false, error: 'Impossibile creare la sessione.' });
-      }
-    });
-
-    socket.on('join-session', (payload = {}, ack = () => {}) => {
-      const requestedId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
-      const pin = normalizePin(payload.pin);
-      const session = requestedId ? sessions.get(requestedId) : findSessionByPin(pin);
-      const rateLimitId = requestedId || pin;
-
-      if (isRateLimited(socket, rateLimitId)) {
-        return ack({ ok: false, error: 'Troppi tentativi. Riprova tra 10 minuti.' });
-      }
-      if (!session || session.ended) {
-        recordFailedAttempt(socket, rateLimitId);
-        return ack({ ok: false, error: 'Sessione non trovata.' });
-      }
-      if (Date.now() > session.pairingExpiresAt) {
-        recordFailedAttempt(socket, session.id);
-        return ack({ ok: false, error: 'Codice scaduto. Crea una nuova sessione.' });
-      }
-      if (session.paired) {
-        recordFailedAttempt(socket, session.id);
-        return ack({ ok: false, error: 'Questa sessione ha già un Parent.' });
-      }
-
-      const suppliedPairingToken = typeof payload.pairingToken === 'string'
-        ? Buffer.from(payload.pairingToken)
-        : Buffer.alloc(0);
-      const expectedPairingToken = Buffer.from(session.pairingToken || '');
-      const validQr = Boolean(requestedId) && suppliedPairingToken.length === expectedPairingToken.length &&
-        suppliedPairingToken.length > 0 && crypto.timingSafeEqual(suppliedPairingToken, expectedPairingToken);
-      const validPin = pin.length === 6 && pin === session.pin;
-      if (!validQr && !validPin) {
-        recordFailedAttempt(socket, session.id);
-        return ack({ ok: false, error: 'Codice non valido.' });
-      }
-
-      clearAttempts(socket, session.id);
-      session.paired = true;
-      session.pin = null;
-      session.pairingToken = null;
-      bindSocketToSession(socket, session, 'parent');
-      ack({
-        ok: true,
-        ...publicSession(session),
-        role: 'parent',
-        resumeToken: session.parentToken
-      });
-      emitPresence(session);
-    });
-
-    socket.on('resume-session', (payload = {}, ack = () => {}) => {
-      const session = typeof payload.sessionId === 'string' ? sessions.get(payload.sessionId) : null;
-      const role = payload.role;
-      if (!session || session.ended || !ROLES.has(role) || typeof payload.resumeToken !== 'string') {
-        return ack({ ok: false, error: 'Sessione non disponibile.' });
-      }
-      const expectedToken = role === 'baby' ? session.babyToken : session.parentToken;
-      const supplied = Buffer.from(payload.resumeToken);
-      const expected = Buffer.from(expectedToken);
-      if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) {
-        return ack({ ok: false, error: 'Token di sessione non valido.' });
-      }
-      if (Date.now() > session.expiresAt) {
-        endSession(session, 'expired');
-        return ack({ ok: false, error: 'Sessione scaduta.' });
-      }
-      bindSocketToSession(socket, session, role);
-      ack({ ok: true, ...publicSession(session), role });
-      emitPresence(session);
-    });
-
-    socket.on('signal', (payload = {}, ack = () => {}) => {
-      const session = authorizeSocket(socket);
-      if (!session) return ack({ ok: false, error: 'Non autorizzato.' });
-      const { type, negotiationId } = payload;
-      if (!SIGNAL_TYPES.has(type) || typeof negotiationId !== 'string' || !/^[A-Za-z0-9_-]{8,80}$/.test(negotiationId)) {
-        return ack({ ok: false, error: 'Segnale non valido.' });
-      }
-      if ((type === 'offer' || type === 'answer') && (!payload.sdp || typeof payload.sdp.sdp !== 'string')) {
-        return ack({ ok: false, error: 'SDP non valido.' });
-      }
-      if (type === 'ice-candidate' && (!payload.candidate || typeof payload.candidate.candidate !== 'string')) {
-        return ack({ ok: false, error: 'Candidato ICE non valido.' });
-      }
-      const peer = getPeerSocket(session, socket.data.role);
-      if (!peer) return ack({ ok: false, error: 'Peer non collegato.' });
-      peer.emit('signal', {
-        type,
-        negotiationId,
-        sdp: payload.sdp,
-        candidate: payload.candidate,
-        from: socket.data.role
-      });
-      ack({ ok: true });
-    });
-
-    socket.on('end-session', (_payload, ack = () => {}) => {
-      const session = authorizeSocket(socket);
-      if (!session) return ack({ ok: false, error: 'Sessione non disponibile.' });
-      endSession(session, `ended-by-${socket.data.role}`);
-      ack({ ok: true });
-    });
-
-    socket.on('disconnect', () => leaveCurrentSession(socket));
+    session.pairToken = null;
+    bind(socket, session, 'parent', session.parent.token);
+    io.to(session.baby.socketId).emit('peer-ready', { role: 'parent' });
+    safeAck(ack, { ok: true, sessionId: session.id, token: session.parent.token, iceServers: getIceServers(), settings: session.settings });
   });
 
-  const cleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const session of sessions.values()) {
-      const bothOffline = !session.babySocketId && !session.parentSocketId;
-      const offlineExpired = bothOffline && session.lastDisconnectedAt &&
-        now - session.lastDisconnectedAt > DISCONNECTED_SESSION_TTL_MS;
-      if (now > session.expiresAt || offlineExpired) endSession(session, 'expired');
+  socket.on('resume-session', (payload = {}, ack) => {
+    const session = sessions.get(String(payload.sessionId || ''));
+    const role = payload.role === 'baby' ? 'baby' : payload.role === 'parent' ? 'parent' : '';
+    const side = session && role ? session[role] : null;
+    const suppliedToken = Buffer.from(String(payload.token || ''));
+    const expectedToken = Buffer.from(String(side?.token || ''));
+    const tokenMatches = suppliedToken.length === expectedToken.length && suppliedToken.length > 0 && crypto.timingSafeEqual(suppliedToken, expectedToken);
+    if (!session || session.ended || !side || !tokenMatches) {
+      return safeAck(ack, { ok: false, error: 'session-not-available' });
     }
-    for (const [key, values] of attempts) {
-      const recent = values.filter((value) => now - value < ATTEMPT_WINDOW_MS);
-      if (recent.length) attempts.set(key, recent);
-      else attempts.delete(key);
-    }
-  }, 30_000);
-  cleanupTimer.unref();
-
-  async function close() {
-    clearInterval(cleanupTimer);
-    io.close();
-    if (server.listening) {
-      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-    }
-  }
-
-  return { app, server, io, sessions, close, iceServers, turnConfigured };
-}
-
-if (require.main === module) {
-  const port = Number(process.env.PORT) || 3000;
-  const instance = createBabyMoonServer();
-  instance.server.listen(port, '0.0.0.0', () => {
-    console.log(`BabyMoon 1.0.4 listening on http://0.0.0.0:${port}`);
+    bind(socket, session, role, side.token);
+    socket.to(session.id).emit('peer-resumed', { role });
+    safeAck(ack, { ok: true, iceServers: getIceServers(), settings: session.settings, peerConnected: Boolean(session[role === 'baby' ? 'parent' : 'baby']?.socketId) });
   });
-}
 
-module.exports = { createBabyMoonServer, parseIceServers };
+  socket.on('signal', payload => {
+    if (!payload || typeof payload !== 'object') return;
+    const role = socket.data.role;
+    const session = authorize(socket, socket.data.sessionId, role);
+    if (!session || JSON.stringify(payload).length > MAX_SIGNAL_BYTES) return;
+    socket.to(session.id).emit('signal', { ...payload, from: role });
+  });
+
+  socket.on('detector-settings', (payload, ack) => {
+    const session = authorize(socket, socket.data.sessionId, 'parent');
+    if (!session) return safeAck(ack, { ok: false, error: 'unauthorized' });
+    session.settings = normalizeSettings(payload);
+    io.to(session.baby.socketId).emit('detector-settings', session.settings);
+    safeAck(ack, { ok: true, settings: session.settings });
+  });
+
+  socket.on('detection', (payload = {}, ack) => {
+    const session = authorize(socket, socket.data.sessionId, 'baby');
+    const type = payload.type === 'cry' ? 'cry' : payload.type === 'motion' ? 'motion' : '';
+    if (!session || !type) return safeAck(ack, { ok: false, error: 'unauthorized' });
+    const cooldown = type === 'cry' ? session.settings.cryCooldown : session.settings.motionCooldown;
+    if (Date.now() - session.lastDetectionAt[type] < cooldown * 1000) return safeAck(ack, { ok: false, error: 'cooldown' });
+    session.lastDetectionAt[type] = Date.now();
+    const event = { id: id(), type, at: Date.now(), confidence: Math.max(0, Math.min(1, Number(payload.confidence) || 0)) };
+    if (session.parent?.socketId) io.to(session.parent.socketId).emit('detection', event);
+    safeAck(ack, { ok: true });
+  });
+
+  socket.on('heartbeat', (_payload, ack) => {
+    const session = authorize(socket, socket.data.sessionId, socket.data.role);
+    safeAck(ack, { ok: Boolean(session), at: Date.now() });
+  });
+
+  socket.on('end-session', (_payload, ack) => {
+    const session = authorize(socket, socket.data.sessionId, socket.data.role);
+    if (!session) return safeAck(ack, { ok: false });
+    safeAck(ack, { ok: true });
+    finishSession(session, 'terminated');
+  });
+
+  socket.on('disconnect', () => {
+    const session = sessions.get(socket.data.sessionId);
+    if (!session || session.ended) return;
+    const role = socket.data.role;
+    if (session[role]?.socketId === socket.id) session[role].socketId = null;
+    socket.to(session.id).emit('peer-disconnected', { role });
+  });
+});
+
+setInterval(() => {
+  const now = Date.now();
+  for (const session of sessions.values()) if (session.ended || now - session.createdAt > SESSION_TTL_MS) finishSession(session, 'expired');
+  for (const [key, value] of attempts) if (value.resetAt < now) attempts.delete(key);
+}, 60000).unref();
+
+if (require.main === module) server.listen(PORT, () => console.log(`BabyMoon 1.1.0 http://localhost:${PORT}`));
+module.exports = { app, server, io, normalizeSettings, getIceServers };

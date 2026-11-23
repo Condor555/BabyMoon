@@ -2,138 +2,22 @@
 <html lang="it">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#07111f">
-  <meta name="description" content="BabyMoon trasforma due telefoni in un baby monitor privato peer-to-peer.">
-  <title>BabyMoon</title>
-  <link rel="manifest" href="/manifest.json?v=1.0.4">
-  <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/app.css?v=1.0.4">
-  <script src="/socket.io/socket.io.js" defer></script>
-  <script src="/app.js?v=1.0.4" defer></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#070b16">
+  <meta name="description" content="BabyMoon: baby monitor privato tra due telefoni, con analisi locale di possibile pianto e movimento.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>BabyMoon — Sempre vicino, anche durante il sonno</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css?v=1.1.0">
 </head>
 <body>
-  <div id="app" class="app-shell">
-    <header class="topbar">
-      <button id="homeButton" class="brand" type="button" aria-label="Torna alla home">
-        <span class="brand-mark" aria-hidden="true">☾</span>
-        <span>BabyMoon</span>
-      </button>
-      <div id="connectionBadge" class="status-badge status-idle" aria-live="polite">
-        <span class="status-dot"></span><span id="connectionText">Pronto</span>
-      </div>
-    </header>
-
-    <main>
-      <section id="homeView" class="view home-view">
-        <div class="hero">
-          <div class="moon" aria-hidden="true">☾</div>
-          <p class="eyebrow">BABY MONITOR PRIVATO</p>
-          <h1>Sempre vicino,<br>anche durante il sonno</h1>
-          <p class="lead">Due telefoni, una connessione WebRTC cifrata. Nessuna registrazione.</p>
-        </div>
-        <div class="role-grid">
-          <button id="babyModeButton" class="role-card role-baby" type="button">
-            <span class="role-icon" aria-hidden="true">◉</span>
-            <span class="role-copy"><strong>Questo telefono resta con il bambino</strong><small>Usa fotocamera e microfono</small></span>
-            <span aria-hidden="true">→</span>
-          </button>
-          <button id="parentModeButton" class="role-card role-parent" type="button">
-            <span class="role-icon" aria-hidden="true">▣</span>
-            <span class="role-copy"><strong>Questo telefono resta con me</strong><small>Guarda e ascolta in diretta</small></span>
-            <span aria-hidden="true">→</span>
-          </button>
-        </div>
-        <p class="privacy-note">🔒 Video e audio viaggiano tra i dispositivi e non vengono salvati.</p>
-      </section>
-
-      <section id="pairView" class="view panel-view hidden" aria-labelledby="pairTitle">
-        <div class="panel">
-          <button class="back-button" data-action="go-home" type="button">← Indietro</button>
-          <p class="eyebrow">MODALITÀ GENITORE</p>
-          <h1 id="pairTitle">Collega BabyMoon</h1>
-          <p id="joinHint" class="muted">Inserisci il codice mostrato sul telefono Baby.</p>
-          <form id="pinForm" class="pin-form">
-            <label for="pinInput">Codice a 6 cifre</label>
-            <input id="pinInput" name="pin" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000 000" required>
-            <button class="primary-button" type="submit">Collega</button>
-          </form>
-          <div id="directJoin" class="direct-join hidden">
-            <p>Il QR è stato letto correttamente.</p>
-            <button id="directJoinButton" class="primary-button" type="button">Apri il monitor</button>
-          </div>
-          <p id="pairError" class="error-message" role="alert"></p>
-        </div>
-      </section>
-
-      <section id="babyView" class="view monitor-view hidden">
-        <video id="localVideo" autoplay muted playsinline></video>
-        <div class="video-shade"></div>
-        <div class="monitor-header">
-          <div><p class="eyebrow">MODALITÀ BABY</p><h1>Monitor attivo</h1></div>
-          <div id="babyPeerStatus" class="pill">In attesa del Parent</div>
-        </div>
-
-        <div id="pairingCard" class="pairing-card">
-          <div class="pairing-copy">
-            <p class="eyebrow">COLLEGA IL PARENT</p>
-            <h2>Scansiona il QR</h2>
-            <p>Oppure usa il codice, valido 5 minuti.</p>
-            <div id="pinDisplay" class="pin-display">——— ———</div>
-          </div>
-          <img id="qrImage" alt="QR code per collegare il telefono Parent">
-        </div>
-
-        <div class="monitor-controls">
-          <button id="flipCameraButton" class="control-button" type="button"><span aria-hidden="true">↻</span>Cambia camera</button>
-          <button id="darkenButton" class="control-button" type="button"><span aria-hidden="true">☾</span>Oscura</button>
-          <button class="control-button danger" data-action="end-session" type="button"><span aria-hidden="true">■</span>Termina</button>
-        </div>
-      </section>
-
-      <section id="parentView" class="view monitor-view parent-monitor hidden">
-        <video id="remoteVideo" autoplay muted playsinline></video>
-        <audio id="remoteAudio" playsinline preload="auto" aria-hidden="true"></audio>
-        <div id="remotePlaceholder" class="remote-placeholder">
-          <div class="spinner" aria-hidden="true"></div>
-          <h1 id="remoteTitle">Connessione in corso…</h1>
-          <p id="remoteMessage">Prepariamo il collegamento P2P.</p>
-          <button id="retryButton" class="secondary-button hidden" type="button">Riprova ora</button>
-        </div>
-        <div class="monitor-header">
-          <div><p class="eyebrow">MODALITÀ GENITORE</p><h1>BabyMoon</h1></div>
-          <div id="mediaBadge" class="pill">In attesa del video</div>
-        </div>
-        <div class="monitor-controls">
-          <button id="audioButton" class="control-button" type="button" aria-pressed="false" disabled><span aria-hidden="true">◖</span><span id="audioButtonText">Audio in attesa</span></button>
-          <button id="fullscreenButton" class="control-button" type="button"><span aria-hidden="true">⛶</span>Schermo intero</button>
-          <button class="control-button danger" data-action="end-session" type="button"><span aria-hidden="true">■</span>Termina</button>
-        </div>
-      </section>
-
-      <section id="diagnosticsView" class="diagnostics hidden" aria-live="polite">
-        <button id="diagnosticsToggle" class="diagnostics-toggle" type="button">Diagnostica <span aria-hidden="true">⌃</span></button>
-        <div id="diagnosticsBody" class="diagnostics-body">
-          <dl>
-            <div><dt>Socket</dt><dd id="diagSocket">—</dd></div>
-            <div><dt>WebRTC</dt><dd id="diagConnection">—</dd></div>
-            <div><dt>ICE</dt><dd id="diagIce">—</dd></div>
-            <div><dt>ICE gathering</dt><dd id="diagGathering">—</dd></div>
-            <div><dt>Signaling</dt><dd id="diagSignaling">—</dd></div>
-            <div><dt>Candidati</dt><dd id="diagCandidates">0 locali · 0 remoti</dd></div>
-            <div><dt>Percorso</dt><dd id="diagPath">STUN / P2P</dd></div>
-            <div><dt>Media</dt><dd id="diagMedia">In attesa</dd></div>
-          </dl>
-        </div>
-      </section>
-    </main>
-
-    <div id="darkOverlay" class="dark-overlay hidden" role="button" tabindex="0" aria-label="Tocca per riattivare lo schermo">
-      <div><span class="status-dot online"></span> Monitor attivo</div>
-      <p>Tocca per riattivare lo schermo</p>
-    </div>
-
-    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
-  </div>
+  <noscript>BabyMoon richiede JavaScript.</noscript>
+  <main id="app" aria-live="polite"></main>
+  <div id="toast" class="toast" role="status" aria-live="assertive" hidden></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/detectors.js?v=1.1.0"></script>
+  <script src="/app.js?v=1.1.0"></script>
 </body>
 </html>

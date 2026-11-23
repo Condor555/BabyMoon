@@ -3,14 +3,18 @@ services:
     name: babymoon
     runtime: node
     plan: free
-    buildCommand: npm install --omit=dev --no-audit --no-fund
+    buildCommand: npm install --omit=dev
     startCommand: npm start
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
-      - key: NODE_ENV
-        value: production
       - key: NODE_VERSION
-        value: 22
+        value: 20.18.0
       - key: PUBLIC_URL
+        sync: false
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
         sync: false
