@@ -1,285 +1,167 @@
 # BabyMoon 🌙
 
-> **Sempre vicino, anche durante il sonno**
+**Sempre vicino, anche durante il sonno.**
 
-BabyMoon trasforma due smartphone in un baby monitor privato. Il dispositivo **Baby** acquisisce fotocamera e microfono; il dispositivo **Parent** riceve lo stream audio/video tramite WebRTC. Socket.IO gestisce esclusivamente pairing, presenza, signaling e riconnessione: il server non registra né archivia audio o video.
+BabyMoon trasforma due telefoni in un baby monitor privato nel browser. Il telefono **Baby** acquisisce fotocamera e microfono; il telefono **Parent** riceve il flusso tramite WebRTC. Il server gestisce soltanto pairing e signaling: non registra né archivia audio o video.
 
-## Stato del progetto
+## Novità V1.0.3 — P2P + STUN
 
-**Versione:** `1.0.2`  
-**Runtime:** Node.js 20+ (Node.js 22 consigliato)  
-**Deploy di riferimento:** Render Web Service con HTTPS
+Questa release riscrive il percorso di negoziazione che poteva lasciare il Parent su `WebRTC: new`:
 
-> [!IMPORTANT]
-> BabyMoon è un progetto software sperimentale, non un dispositivo medico o di sicurezza certificato. Non deve sostituire la supervisione di un adulto né essere l’unico sistema usato per la sicurezza di un bambino.
+- il **Baby è l’unico offerer**; non esistono più due offer concorrenti;
+- il Parent usa transceiver `recvonly` e **non richiede fotocamera o microfono**;
+- ogni negoziazione ha un `negotiationId`, quindi i messaggi di tentativi precedenti vengono ignorati;
+- i candidati ICE arrivati in anticipo restano in coda fino a `setRemoteDescription()`;
+- viene segnalata anche la fine della raccolta ICE;
+- timeout esplicito e nuova negoziazione con ICE restart;
+- riconnessione Socket.IO con resume autenticato della sessione;
+- STUN pubblico configurato dal backend;
+- diagnostica separata per signaling, ICE, candidati e media realmente ricevuti;
+- identificazione del percorso selezionato: **Diretta P2P** oppure **Relay TURN**;
+- cache PWA aggiornata a `babymoon-v1.0.3`.
 
-## Funzioni V1
+## Flusso
 
-### Baby
+1. Sul telefono vicino al bambino scegli **Questo telefono resta con il bambino**.
+2. Concedi fotocamera e microfono.
+3. Sul Parent scansiona il QR oppure inserisci il PIN a 6 cifre.
+4. Il Baby crea una sola offerta WebRTC.
+5. Entrambi raccolgono candidati host/STUN e cercano un percorso diretto.
+6. Se la connessione cade, BabyMoon ritenta con backoff `0 / 2 / 5 / 10 / 30 / 60 s`.
 
-- acquisizione reale di fotocamera e microfono;
-- preview locale con indicatori video/audio;
-- QR e PIN di pairing;
-- cambio fotocamera senza interrompere il microfono;
-- modalità **Oscura** con riattivazione affidabile tramite touch, pointer, click o tastiera;
-- Screen Wake Lock, quando supportato dal browser;
-- rilascio completo di camera e microfono quando la sessione termina.
+> Il Parent non deve concedere fotocamera o microfono: riceve soltanto. Su iOS/Safari può essere necessario premere **Attiva audio** per soddisfare le regole di autoplay.
 
-### Parent
+## ICE e STUN
 
-- accesso tramite QR oppure PIN a 6 cifre;
-- ricezione robusta delle tracce remote video e audio;
-- fallback per le autoplay policy mobili con pulsante **Attiva audio**;
-- Audio/Mute, fullscreen dove supportato e stato LIVE;
-- stato visibile di attesa/riconnessione e pulsante **Riprova ora**.
-
-### Affidabilità
-
-- un solo initiator WebRTC: il dispositivo Baby;
-- protezione contro offerte concorrenti;
-- coda degli ICE candidate fino alla `remoteDescription`;
-- identificatore univoco per ogni negoziazione, così i candidati ICE di un tentativo precedente non contaminano quello successivo;
-- SDP inviato dopo una breve raccolta ICE: i candidati viaggiano sia nell'SDP sia tramite trickle ICE, evitando una dipendenza da un solo percorso di signaling;
-- timeout ICE esplicito con conteggio dei candidati locali/remoti e indicazione visibile dello stato TURN;
-- ricreazione pulita della `RTCPeerConnection` senza peer sovrapposti;
-- riconnessione automatica con backoff `0 s → 2 s → 5 s → 10 s → 30 s → 60 s`;
-- recupero su cambio rete, ritorno online e ritorno dell’app in primo piano, entro i limiti del browser mobile;
-- watchdog `RTCPeerConnection.getStats()` ogni 5 secondi: se il traffico media non avanza per 20 secondi, viene avviato un recupero controllato;
-- diagnostica in-app con stato WebRTC, bitrate, tipo di candidato, protocollo e RTT quando disponibili;
-- terminazione volontaria distinta da una perdita temporanea di rete.
-
-## Flusso rapido
-
-1. Sul primo telefono apri BabyMoon e scegli **Modalità Baby**.
-2. Concedi i permessi per fotocamera e microfono.
-3. Sul secondo telefono:
-   - scansiona il QR; oppure
-   - apri **Modalità Genitore** e inserisci il PIN.
-4. Sul Parent, se il browser blocca l’audio automatico, tocca **Attiva audio**.
-5. Premendo **Termina** su uno dei due dispositivi, la sessione viene invalidata e chiusa su entrambi.
-
-## Architettura
+L’endpoint `GET /api/ice-config` fornisce ai client:
 
 ```text
-Telefono Baby                         Telefono Parent
-camera + microfono                    video + audio
-       │                                     │
-       └──────── WebRTC peer-to-peer ────────┘
-                       │
-                 STUN / TURN
-
-Entrambi i telefoni ── Socket.IO signaling ── Node.js/Express
+stun:stun.cloudflare.com:3478
+stun:stun.l.google.com:19302
+stun:stun1.l.google.com:19302
 ```
 
-- **Express 5** serve la PWA e le API minime.
-- **Socket.IO** gestisce join autenticato, presenza, signaling, retry e fine sessione.
-- **WebRTC** trasporta audio e video direttamente quando la rete lo consente.
-- **STUN** Google è configurato come fallback iniziale.
-- **TURN autenticato** può essere aggiunto tramite variabili d’ambiente.
+STUN aiuta i dispositivi a scoprire i propri indirizzi pubblici, ma non inoltra il video. Il media resta peer-to-peer quando ICE seleziona un candidate pair diretto.
 
-## Modello di sicurezza
-
-### Pairing e token
-
-- PIN numerico casuale a 6 cifre, valido per **5 minuti** e utilizzabile solo per il primo pairing;
-- QR con token casuale forte da 256 bit, distinto dal PIN e monouso;
-- token Baby da 256 bit;
-- token Parent da 256 bit emesso solo dopo il primo pairing riuscito;
-- il token Parent viene conservato in `sessionStorage` per consentire la riconnessione della stessa scheda senza rendere riutilizzabile il PIN;
-- dopo il primo Parent, ulteriori tentativi senza il token Parent corretto vengono rifiutati;
-- **Termina** elimina immediatamente sessione e token sul server.
-
-### Protezioni server
-
-- massimo **5 tentativi falliti** per IP/sessione, poi blocco temporaneo di 10 minuti;
-- limite di 10 nuove sessioni per IP nella stessa finestra temporale;
-- autorizzazione di ogni evento Socket.IO in base a socket, sessione e ruolo;
-- destinazione del signaling derivata dal server, mai scelta liberamente dal client;
-- validazione di ruolo, codice, token, SDP e ICE candidate;
-- payload HTTP e Socket.IO limitati;
-- HTTPS obbligatorio quando `NODE_ENV=production`;
-- CSP, HSTS/Helmet, `Permissions-Policy`, `Referrer-Policy: no-referrer`, protezione anti-frame e rimozione di `X-Powered-By`;
-- endpoint di terminazione HTTP autenticato come fallback al canale Socket.IO.
-
-### Limiti del modello
-
-- il signaling è mantenuto in memoria: il deploy deve usare una singola istanza, oppure un adapter condiviso (per esempio Redis) prima di scalare orizzontalmente;
-- il rate limiting è in memoria e per singola istanza;
-- un PIN a 6 cifre resta un segreto breve: usare preferibilmente il QR con token forte;
-- STUN da solo non attraversa tutte le reti/NAT; per uso affidabile tra Wi‑Fi e rete mobile serve TURN;
-- le API mobili possono sospendere una PWA in background nonostante Wake Lock e riconnessione. Effettuare test reali sui dispositivi target;
-- BabyMoon non effettua cifratura applicativa aggiuntiva: WebRTC usa DTLS-SRTP per il media transport.
-
-## Requisiti
-
-- Node.js `>=20`;
-- npm;
-- browser moderno con WebRTC e `getUserMedia()`;
-- HTTPS in produzione (`localhost` è ammesso nello sviluppo locale);
-- due dispositivi per il collaudo end-to-end.
+**Limite importante:** STUN non può attraversare ogni NAT o firewall. Se la diagnostica mostra candidati locali/remoti ma ICE termina in `failed`, alcune combinazioni di rete richiedono un relay TURN. La V1.0.3 accetta TURN autenticato tramite variabili d’ambiente, ma non lo abilita né genera costi automaticamente.
 
 ## Avvio locale
 
+Prerequisito: Node.js 20 o successivo.
+
 ```bash
-git clone https://github.com/Condor555/BabyMoon.git
-cd BabyMoon
-npm ci
-npm run dev
+npm install
+npm run verify
+npm start
 ```
 
-Apri `http://localhost:3000`.
+Apri `http://localhost:3000`. Fotocamera e microfono funzionano su `localhost`; sui telefoni serve HTTPS.
+
+## Deploy gratuito su Render
+
+1. Pubblica la repository su GitHub.
+2. In Render scegli **New → Blueprint** e collega la repository.
+3. Render legge `render.yaml` e crea un Web Service Node.
+4. Imposta `PUBLIC_URL` sull’origine HTTPS assegnata, senza slash finale, ad esempio:
+
+   ```text
+   https://babymoon-xxxx.onrender.com
+   ```
+
+5. Esegui il deploy.
+6. Dopo l’aggiornamento chiudi completamente pagina/PWA su entrambi i telefoni e crea una **nuova sessione**.
+
+Il piano gratuito di Render può sospendere il servizio quando non è usato; il primo accesso può quindi richiedere tempo.
 
 ## Variabili d’ambiente
 
 | Variabile | Obbligatoria | Descrizione |
 |---|---:|---|
-| `PORT` | No | Porta HTTP; default `3000` |
-| `NODE_ENV` | In produzione | Impostare `production` per forzare HTTPS |
-| `PUBLIC_URL` | Consigliata | URL pubblico HTTPS senza slash finale, es. `https://babymoon.onrender.com` |
-| `TURN_URLS` | No | URL TURN separati da virgola, es. `turn:host:3478?transport=udp,turns:host:5349` |
-| `TURN_USERNAME` | Con TURN | Username TURN |
-| `TURN_CREDENTIAL` | Con TURN | Credenziale TURN |
+| `PORT` | no | Porta HTTP, predefinita `3000` |
+| `NODE_ENV` | sì in produzione | Usa `production` su Render |
+| `PUBLIC_URL` | consigliata | Origine HTTPS usata nel QR |
+| `TURN_URLS` | no | URL TURN separati da virgola |
+| `TURN_USERNAME` | no | Username TURN |
+| `TURN_CREDENTIAL` | no | Password/credenziale TURN |
 
-Esempio locale senza segreti reali:
+Non inserire credenziali reali in GitHub. Se in futuro si usa un provider con chiave permanente, il backend deve convertirla in credenziali TURN temporanee; la chiave permanente non deve arrivare al browser.
 
-```bash
-PUBLIC_URL=http://localhost:3000 npm start
-```
+## Test consigliati
 
-### Gestione dei segreti TURN
+### 1. Hotspot / stessa rete
 
-- non inserire credenziali in Git, `.env` versionati, log o screenshot;
-- configurarle come secret nella dashboard del provider;
-- preferire credenziali TURN temporanee emesse da un servizio dedicato;
-- se si usano credenziali statiche, limitarle e ruotarle periodicamente;
-- in caso di esposizione, revocare/ruotare immediatamente username e credenziale;
-- il client deve ricevere necessariamente una credenziale utilizzabile: non considerare un secret TURN statico inviato al browser come segreto permanente.
+- Telefono A crea l’hotspot.
+- Telefono B si collega all’hotspot.
+- Avvia una nuova sessione.
+- Verifica la progressione `new → checking → connected/completed`.
+- In diagnostica devono comparire candidati locali e remoti.
 
-## Deploy HTTPS su Render
+### 2. Reti diverse
 
-1. Carica questa repository su GitHub.
-2. In Render scegli **New → Blueprint**.
-3. Collega `Condor555/BabyMoon` e seleziona `render.yaml`.
-4. Imposta `PUBLIC_URL` con l’URL HTTPS pubblico assegnato al servizio.
-5. Non configurare TURN finché non hai un server/servizio TURN; quando disponibile, aggiungi le tre variabili TURN come secret nella dashboard.
-6. Verifica `GET /api/health`, che deve restituire la versione `1.0.2`.
+- Baby su Wi-Fi.
+- Parent su 4G/5G o un’altra Wi-Fi.
+- Crea una nuova sessione.
+- Se compare **Diretta P2P**, STUN è sufficiente per quelle reti.
+- Se ICE arriva a `failed` nonostante i candidati, serve probabilmente TURN.
 
-Il Blueprint usa:
+### 3. Regressioni
 
-```text
-build: npm ci
-start: npm start
-health: /api/health
-```
+Verifica anche:
 
-## Script npm
+- video Parent;
+- pulsante **Attiva audio**;
+- cambio camera Baby;
+- **Oscura** e tocco per riattivare;
+- **Termina** da entrambi i dispositivi;
+- riconnessione automatica dopo un’interruzione breve;
+- **Riprova ora**;
+- QR e PIN;
+- nessuna richiesta di camera/microfono sul Parent.
 
-| Comando | Scopo |
-|---|---|
-| `npm run dev` | server con watch mode |
-| `npm start` | avvio produzione |
-| `npm run check` | controllo sintattico server/client |
-| `npm test` | test Node.js |
-| `npm run validate` | check + test completi |
+## Sicurezza e privacy
 
-## Test inclusi
+- WebRTC cifra il media con DTLS-SRTP.
+- PIN e QR scadono dopo 5 minuti e diventano inutilizzabili dopo il pairing.
+- QR usa un token casuale da 256 bit.
+- Baby e Parent ricevono token di resume distinti.
+- Un solo Parent può associarsi.
+- Il server autorizza ruolo, sessione e socket per ogni segnale.
+- Cinque pairing falliti attivano un blocco temporaneo per IP/sessione.
+- **Termina** invalida la sessione per entrambi.
+- Header di sicurezza e redirect HTTPS sono abilitati in produzione.
+- Le sessioni risiedono in memoria; un riavvio del server le chiude intenzionalmente.
 
-La suite verifica:
+BabyMoon è un progetto sperimentale, non un dispositivo medico o di sicurezza certificato. Non sostituisce la supervisione di un adulto.
 
-- pairing PIN;
-- pairing QR con token forte;
-- token Parent e rifiuto di Parent aggiuntivi;
-- relay offer/answer tramite signaling autorizzato;
-- richiesta di riconnessione;
-- terminazione bidirezionale via Socket.IO;
-- terminazione HTTP autenticata;
-- invalidazione della sessione;
-- rate limiting;
-- header di sicurezza e configurazione TURN;
-- contratto client per controlli delegati, audio/video, autoplay fallback, riconnessione, Wake Lock, lifecycle e watchdog.
-
-```bash
-npm run validate
-```
-
-I test automatici non sostituiscono una prova WebRTC su hardware reale. Prima di considerare una release pronta, eseguire almeno la matrice seguente:
-
-| Scenario | QR | PIN | Video | Audio | Retry | Termina |
-|---|---:|---:|---:|---:|---:|---:|
-| iPhone Safari ↔ iPhone Safari | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Android Chrome ↔ iPhone Safari | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Wi‑Fi ↔ Wi‑Fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Wi‑Fi ↔ 4G/5G con TURN | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| cambio Wi‑Fi ↔ 4G/5G | ✓ | ✓ | ripristino | ripristino | automatico | ✓ |
-| breve background/foreground | ✓ | ✓ | ripristino | ripristino | automatico | ✓ |
-
-## Struttura della repository
+## Struttura
 
 ```text
-BabyMoon/
-├── .github/workflows/ci.yml
+.
+├── server.js                 # HTTPS redirect, pairing, signaling, ICE config
 ├── public/
-│   ├── app.js
-│   ├── icon.svg
-│   ├── index.html
-│   ├── manifest.webmanifest
-│   ├── styles.css
-│   └── sw.js
+│   ├── index.html            # UI mobile-first
+│   ├── app.css
+│   ├── app.js                # media, WebRTC, ICE, recovery e diagnostica
+│   ├── manifest.json
+│   ├── sw.js
+│   └── icon.svg
 ├── test/
-│   ├── client.contract.test.js
-│   └── server.integration.test.js
-├── .gitignore
-├── package.json
-├── package-lock.json
+│   ├── server.test.js
+│   └── client.contract.test.js
+├── .github/workflows/ci.yml
 ├── render.yaml
-└── server.js
+├── Dockerfile
+└── .env.example
 ```
 
-## Diagnostica
+## Comandi
 
-- `/api/health`: stato e versione del servizio;
-- `/api/config`: ICE server pubblici forniti al client e flag `hasTurn` per la diagnostica;
-- overlay live: stato WebRTC, bitrate, candidato/protocollo e RTT quando esposti dal browser;
-- console browser: errori di autoplay, Wake Lock, `getStats`, signaling e media device;
-- log server: errori applicativi senza registrare audio/video.
-
-Se il Parent resta nero:
-
-1. verifica che sul Baby siano presenti sia la traccia video sia quella audio;
-2. controlla l’overlay: `Video/Audio negoziato` conferma solo lo scambio SDP, mentre `Video/Audio ricevuto` appare dopo la connessione ICE;
-3. controlla se la diagnostica mostra `TURN attivo` oppure `TURN non configurato`;
-4. premi **Riprova ora**;
-5. configura TURN se i dispositivi sono su reti diverse o la diagnostica resta su `WebRTC new`/`ICE checking`;
-6. su iOS tocca **Attiva audio** per soddisfare l’autoplay policy.
-
-## Privacy
-
-BabyMoon non implementa registrazioni, screenshot, storico o upload media. I flussi audio/video viaggiano tramite WebRTC; il server conserva solo dati temporanei di sessione in memoria.
-
-## Release 1.0.2
-
-- fix del Parent fermo su `WebRTC new` con raccolta ICE ibrida (SDP completo + trickle ICE);
-- ogni negoziazione usa un ID univoco e ignora candidati ICE obsoleti durante i retry;
-- timer di connessione iniziale e diagnostica dei candidati locali/remoti;
-- stato `Video/Audio negoziato` distinto da media realmente ricevuto;
-- indicazione visibile `TURN attivo/non configurato` e messaggio esplicito quando la sola connessione diretta può non bastare;
-- cache PWA aggiornata e asset versionati per evitare che il deploy continui a usare il client 1.0.1.
-
-## Release 1.0.1
-
-- fix completo ricezione video nera sul Parent;
-- fix catena audio Baby → Parent e autoplay iOS;
-- fix controlli Baby/Parent dopo i rerender;
-- fix Oscura/riattiva su mobile;
-- terminazione bidirezionale con invalidazione immediata;
-- riconnessione automatica, backoff e retry manuale;
-- Wake Lock, lifecycle mobile, diagnostica e watchdog `getStats()`;
-- pairing monouso con PIN e QR token forte;
-- hardening Socket.IO/HTTP, HTTPS e header;
-- predisposizione TURN autenticato;
-- PWA con service worker network-first;
-- test e CI GitHub Actions.
+```bash
+npm run check   # controllo sintattico
+npm test        # test server + contratti client
+npm run verify  # entrambi
+```
 
 ## Licenza
 
-Al momento non è incluso un file di licenza open source. In assenza di licenza, tutti i diritti restano al titolare del repository.
+Uso privato/sperimentale. Aggiungi una licenza esplicita prima di distribuire il progetto pubblicamente.

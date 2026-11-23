@@ -1,69 +1,43 @@
-import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import test from 'node:test';
+'use strict';
 
-const appPath = new URL('../public/app.js', import.meta.url);
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
 
-async function source() {
-  return readFile(appPath, 'utf8');
-}
+const app = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+const sw = fs.readFileSync(path.join(__dirname, '../public/sw.js'), 'utf8');
 
-test('client uses stable delegated controls and no implicit DOM globals', async () => {
-  const code = await source();
-  assert.doesNotMatch(code, /\.(onclick|oninput|ontouch|onpointer)\s*=/);
-  assert.match(code, /app\.addEventListener\('click'/);
-  assert.match(code, /app\.addEventListener\('pointerup'/);
-  assert.match(code, /app\.addEventListener\('touchend'/);
-
-  for (const action of [
-    'switch-camera',
-    'dark-screen',
-    'wake-screen',
-    'toggle-audio',
-    'fullscreen',
-    'retry',
-    'end-session',
-  ]) {
-    assert.match(code, new RegExp(`data-action=["']${action}["']`));
-    assert.match(code, new RegExp(`case ["']${action}["']`));
-  }
+test('Baby is the sole WebRTC offerer and Parent is receive-only', () => {
+  assert.match(app, /state\.mode !== 'baby'/);
+  assert.match(app, /addTransceiver\('video', \{ direction: 'recvonly' \}\)/);
+  assert.match(app, /addTransceiver\('audio', \{ direction: 'recvonly' \}\)/);
+  assert.match(app, /if \(state\.mode !== 'parent' \|\| payload\.from !== 'baby'\) return/);
 });
 
-test('client contract covers audio/video, autoplay fallback and clean WebRTC retries', async () => {
-  const code = await source();
-  assert.match(code, /getUserMedia\([\s\S]*audio:/);
-  assert.match(code, /peer\.addTrack\(track, state\.localStream\)/);
-  assert.match(code, /peer\.ontrack = receiveRemoteTrack/);
-  assert.match(code, /video\.srcObject = state\.remoteStream/);
-  assert.match(code, /Avvia video e audio/);
-  assert.match(code, /video\.muted = false/);
-  assert.match(code, /RETRY_DELAYS = \[0, 2_000, 5_000, 10_000, 30_000, 60_000\]/);
-  assert.match(code, /closePeer\(\);[\s\S]*createAndSendOffer\(\{ restart: true \}\)/);
-  assert.match(code, /session-ended/);
-  assert.match(code, /if \(!state\.mode \|\| state\.ending/);
-  assert.match(code, /waitForIceGathering\(peer\)/);
-  assert.match(code, /negotiationId/);
-  assert.match(code, /candidate\.toJSON/);
-  assert.match(code, /Timeout ICE/);
-  assert.match(code, /Non è configurato un server TURN/);
+test('ICE candidates are queued until a remote description exists', () => {
+  assert.match(app, /candidateQueues: new Map\(\)/);
+  assert.match(app, /!state\.pc\?\.remoteDescription/);
+  assert.match(app, /flushCandidateQueue/);
+  assert.match(app, /end-of-candidates/);
 });
 
-test('client contract covers mobile lifecycle, Wake Lock and getStats watchdog', async () => {
-  const code = await source();
-  assert.match(code, /navigator\.wakeLock\.request\('screen'\)/);
-  assert.match(code, /peer\.getStats\(\)/);
-  assert.match(code, /Watchdog: stream senza traffico multimediale/);
-  assert.match(code, /visibilitychange/);
-  assert.match(code, /window\.addEventListener\('online'/);
-  assert.match(code, /window\.addEventListener\('offline'/);
-  assert.match(code, /window\.addEventListener\('pageshow'/);
+test('connection recovery uses bounded backoff and ICE restarts', () => {
+  assert.match(app, /RETRY_DELAYS = \[0, 2_000, 5_000, 10_000, 30_000, 60_000\]/);
+  assert.match(app, /createOffer\(\{ iceRestart: Boolean\(forceRestart\) \}\)/);
+  assert.match(app, /resume-session/);
 });
 
-test('QR and PIN converge on the same authenticated Parent join flow', async () => {
-  const code = await source();
-  assert.match(code, /joinParent\(input\.value, element\.dataset\.source \|\| 'pin'\)/);
-  assert.match(code, /arrivedFromQr \? 'qr' : 'pin'/);
-  assert.match(code, /pairingToken: state\.mode === 'parent'/);
-  assert.match(code, /participantToken/);
-  assert.match(code, /sessionStorage\.setItem/);
+test('Parent never requests camera or microphone', () => {
+  const acquireFunction = app.slice(app.indexOf('async function acquireBabyMedia'), app.indexOf('async function startBabyMode'));
+  assert.match(acquireFunction, /getUserMedia/);
+  const joinFunction = app.slice(app.indexOf('async function joinParent'), app.indexOf('function handlePresence'));
+  assert.doesNotMatch(joinFunction, /getUserMedia/);
+});
+
+test('PWA and UI are versioned consistently', () => {
+  assert.match(app, /VERSION = '1\.0\.3'/);
+  assert.match(html, /app\.js\?v=1\.0\.3/);
+  assert.match(sw, /babymoon-v1\.0\.3/);
 });

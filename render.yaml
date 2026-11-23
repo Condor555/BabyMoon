@@ -3,15 +3,14 @@ services:
     name: babymoon
     runtime: node
     plan: free
-    buildCommand: npm ci
+    buildCommand: npm install --omit=dev --no-audit --no-fund
     startCommand: npm start
     healthCheckPath: /api/health
+    autoDeploy: true
     envVars:
-      - key: NODE_VERSION
-        value: 22
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 22
       - key: PUBLIC_URL
         sync: false
-      # TURN_URLS, TURN_USERNAME e TURN_CREDENTIAL sono opzionali.
-      # Configurali come secret direttamente nella dashboard Render, non nel repository.

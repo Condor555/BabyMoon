@@ -1,0 +1,119 @@
+:root {
+  color-scheme: dark;
+  --bg: #07111f;
+  --bg-soft: #0d1a2b;
+  --panel: rgba(17, 31, 49, 0.94);
+  --line: rgba(255, 255, 255, 0.12);
+  --text: #f8fafc;
+  --muted: #a8b2c1;
+  --moon: #f4ce70;
+  --blue: #78b9ff;
+  --green: #62d49b;
+  --red: #ff8b8b;
+  --shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+body { min-height: 100dvh; overflow-x: hidden; }
+button, input { font: inherit; }
+button { color: inherit; }
+.hidden { display: none !important; }
+
+.app-shell { min-height: 100dvh; background: radial-gradient(circle at 50% -20%, #1b3552 0, var(--bg) 42%); }
+.topbar {
+  position: fixed; inset: 0 0 auto 0; z-index: 30; height: calc(64px + env(safe-area-inset-top));
+  padding: env(safe-area-inset-top) 20px 0; display: flex; align-items: center; justify-content: space-between;
+  background: linear-gradient(180deg, rgba(7,17,31,.96), rgba(7,17,31,.3));
+}
+.brand { border: 0; background: none; padding: 0; display: flex; align-items: center; gap: 8px; font-weight: 800; cursor: pointer; }
+.brand-mark { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; background: var(--moon); color: var(--bg); font-size: 22px; }
+.status-badge, .pill { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 999px; background: rgba(7,17,31,.72); padding: 8px 12px; font-size: 12px; backdrop-filter: blur(14px); }
+.status-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #9aa4b2; box-shadow: 0 0 0 4px rgba(154,164,178,.12); }
+.status-connecting .status-dot { background: var(--moon); box-shadow: 0 0 0 4px rgba(244,206,112,.14); }
+.status-online .status-dot, .status-dot.online { background: var(--green); box-shadow: 0 0 0 4px rgba(98,212,155,.14); }
+.status-error .status-dot { background: var(--red); }
+
+main { min-height: 100dvh; }
+.view { min-height: 100dvh; padding: calc(92px + env(safe-area-inset-top)) 20px calc(36px + env(safe-area-inset-bottom)); }
+.home-view { display: grid; align-content: center; max-width: 920px; margin: 0 auto; }
+.hero { text-align: center; max-width: 620px; margin: 0 auto 36px; }
+.moon { width: 72px; height: 72px; margin: 0 auto 22px; border-radius: 50%; display: grid; place-items: center; background: var(--moon); color: var(--bg); font-size: 54px; box-shadow: 0 0 70px rgba(244,206,112,.25); }
+.eyebrow { margin: 0 0 8px; color: var(--moon); font-size: 11px; font-weight: 800; letter-spacing: .16em; }
+h1, h2, p { margin-top: 0; }
+h1 { margin-bottom: 14px; font-size: clamp(32px, 8vw, 58px); line-height: 1.04; letter-spacing: -.04em; }
+h2 { margin-bottom: 8px; font-size: 28px; }
+.lead, .muted, .pairing-copy p { color: var(--muted); line-height: 1.6; }
+.role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.role-card { min-height: 132px; border: 1px solid var(--line); border-radius: 24px; padding: 22px; background: linear-gradient(135deg, rgba(255,255,255,.08), rgba(255,255,255,.025)); display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; text-align: left; cursor: pointer; box-shadow: var(--shadow); }
+.role-card:active { transform: scale(.985); }
+.role-icon { display: grid; place-items: center; width: 48px; height: 48px; border-radius: 16px; color: var(--bg); background: var(--moon); font-size: 25px; }
+.role-parent .role-icon { background: var(--blue); }
+.role-copy { display: grid; gap: 7px; }
+.role-copy strong { font-size: 16px; }
+.role-copy small { color: var(--muted); line-height: 1.4; }
+.privacy-note { margin: 28px 0 0; color: var(--muted); text-align: center; font-size: 13px; }
+
+.panel-view { display: grid; place-items: center; }
+.panel { width: min(100%, 480px); border: 1px solid var(--line); border-radius: 28px; padding: 28px; background: var(--panel); box-shadow: var(--shadow); }
+.panel h1 { font-size: 38px; }
+.back-button { margin: 0 0 32px; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.pin-form { display: grid; gap: 12px; margin-top: 30px; }
+.pin-form label { font-size: 13px; font-weight: 700; }
+.pin-form input { width: 100%; border: 1px solid var(--line); border-radius: 16px; background: var(--bg-soft); color: var(--text); padding: 18px; font-size: 28px; font-weight: 800; letter-spacing: .2em; text-align: center; outline: none; }
+.pin-form input:focus { border-color: var(--blue); box-shadow: 0 0 0 4px rgba(120,185,255,.12); }
+.primary-button, .secondary-button { border: 0; border-radius: 16px; padding: 16px 20px; background: var(--moon); color: var(--bg); font-weight: 800; cursor: pointer; }
+.secondary-button { border: 1px solid var(--line); background: rgba(255,255,255,.08); color: var(--text); }
+.direct-join { text-align: center; padding-top: 20px; }
+.error-message { min-height: 22px; margin: 16px 0 0; color: var(--red); font-size: 13px; }
+
+.monitor-view { position: relative; overflow: hidden; padding: 0; background: #02060d; }
+.monitor-view video { width: 100%; height: 100dvh; display: block; object-fit: cover; background: #02060d; }
+.parent-monitor video { object-fit: contain; }
+.video-shade { pointer-events: none; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,.52), transparent 25%, transparent 66%, rgba(0,0,0,.7)); }
+.monitor-header { position: absolute; z-index: 5; inset: calc(88px + env(safe-area-inset-top)) 20px auto; display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.monitor-header h1 { margin: 0; font-size: 26px; }
+.pairing-card { position: absolute; z-index: 7; inset: 50% auto auto 50%; transform: translate(-50%, -50%); width: min(calc(100% - 36px), 640px); display: grid; grid-template-columns: 1fr 190px; gap: 28px; align-items: center; border: 1px solid var(--line); border-radius: 28px; padding: 28px; background: rgba(7,17,31,.92); backdrop-filter: blur(20px); box-shadow: var(--shadow); }
+.pairing-card img { width: 100%; border-radius: 16px; background: white; }
+.pin-display { margin-top: 18px; font-size: clamp(28px, 8vw, 46px); font-weight: 900; letter-spacing: .12em; }
+.monitor-controls { position: absolute; z-index: 9; inset: auto 16px calc(20px + env(safe-area-inset-bottom)); display: flex; justify-content: center; gap: 10px; }
+.control-button { min-width: 92px; border: 1px solid var(--line); border-radius: 18px; background: rgba(7,17,31,.78); padding: 12px 14px; display: grid; gap: 5px; place-items: center; font-size: 11px; backdrop-filter: blur(16px); cursor: pointer; }
+.control-button span:first-child { font-size: 20px; }
+.control-button.danger { color: #ffd3d3; border-color: rgba(255,139,139,.35); }
+.remote-placeholder { position: absolute; z-index: 2; inset: 0; display: grid; place-content: center; justify-items: center; text-align: center; padding: 24px; background: radial-gradient(circle at 50% 35%, #12243a, #02060d 58%); }
+.remote-placeholder h1 { margin: 20px 0 8px; font-size: 28px; }
+.remote-placeholder p { max-width: 420px; color: var(--muted); }
+.spinner { width: 42px; height: 42px; border: 3px solid rgba(255,255,255,.16); border-top-color: var(--moon); border-radius: 50%; animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.diagnostics { position: fixed; z-index: 20; right: 14px; bottom: calc(105px + env(safe-area-inset-bottom)); width: min(360px, calc(100% - 28px)); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; background: rgba(7,17,31,.88); backdrop-filter: blur(18px); }
+.diagnostics-toggle { width: 100%; border: 0; background: transparent; display: flex; justify-content: space-between; padding: 12px 14px; cursor: pointer; font-size: 12px; font-weight: 800; }
+.diagnostics-body { border-top: 1px solid var(--line); padding: 6px 14px 10px; }
+.diagnostics-body dl { margin: 0; }
+.diagnostics-body dl div { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; font-size: 11px; }
+.diagnostics-body dt { color: var(--muted); }
+.diagnostics-body dd { margin: 0; text-align: right; }
+.dark-overlay { position: fixed; z-index: 100; inset: 0; display: grid; place-content: center; justify-items: center; background: #000; color: #313843; font-size: 12px; cursor: pointer; }
+.dark-overlay div { display: flex; align-items: center; gap: 9px; color: #56606d; }
+.dark-overlay p { margin-top: 18px; }
+.toast { position: fixed; z-index: 120; left: 50%; bottom: calc(28px + env(safe-area-inset-bottom)); transform: translateX(-50%); width: max-content; max-width: calc(100% - 32px); padding: 12px 16px; border: 1px solid var(--line); border-radius: 14px; background: #17263a; box-shadow: var(--shadow); font-size: 13px; }
+
+@media (max-width: 680px) {
+  .topbar { padding-left: 14px; padding-right: 14px; }
+  .role-grid { grid-template-columns: 1fr; }
+  .hero { margin-bottom: 26px; }
+  .moon { width: 60px; height: 60px; font-size: 44px; }
+  .pairing-card { grid-template-columns: 1fr 130px; gap: 16px; padding: 20px; }
+  .pairing-card h2 { font-size: 23px; }
+  .pairing-copy p { font-size: 13px; }
+  .monitor-header { left: 14px; right: 14px; }
+  .pill { max-width: 160px; text-align: center; }
+}
+
+@media (max-width: 430px) {
+  .pairing-card { grid-template-columns: 1fr; text-align: center; }
+  .pairing-card img { width: 124px; margin: 0 auto; }
+  .pin-display { font-size: 30px; }
+  .control-button { min-width: 82px; padding: 11px 9px; }
+}
