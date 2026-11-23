@@ -9,5 +9,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22
+      - key: NODE_ENV
+        value: production
       - key: PUBLIC_URL
         sync: false
+      # TURN_URLS, TURN_USERNAME e TURN_CREDENTIAL sono opzionali.
+      # Configurali come secret direttamente nella dashboard Render, non nel repository.

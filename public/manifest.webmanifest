@@ -1,1 +1,21 @@
-{"name":"BabyMoon","short_name":"BabyMoon","description":"Baby monitor privato con due telefoni","start_url":"/","display":"standalone","background_color":"#eef6ff","theme_color":"#eef6ff","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}
+{
+  "id": "/",
+  "name": "BabyMoon",
+  "short_name": "BabyMoon",
+  "description": "Sempre vicino, anche durante il sonno",
+  "lang": "it",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#eef6ff",
+  "theme_color": "#eef6ff",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
