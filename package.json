@@ -1,6 +1,6 @@
 {
   "name": "babymoon",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "description": "Private, browser-based P2P baby monitor using WebRTC, STUN and Socket.IO signaling.",
   "type": "commonjs",

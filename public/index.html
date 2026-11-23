@@ -6,11 +6,11 @@
   <meta name="theme-color" content="#07111f">
   <meta name="description" content="BabyMoon trasforma due telefoni in un baby monitor privato peer-to-peer.">
   <title>BabyMoon</title>
-  <link rel="manifest" href="/manifest.json?v=1.0.3">
+  <link rel="manifest" href="/manifest.json?v=1.0.4">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/app.css?v=1.0.3">
+  <link rel="stylesheet" href="/app.css?v=1.0.4">
   <script src="/socket.io/socket.io.js" defer></script>
-  <script src="/app.js?v=1.0.3" defer></script>
+  <script src="/app.js?v=1.0.4" defer></script>
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -92,7 +92,8 @@
       </section>
 
       <section id="parentView" class="view monitor-view parent-monitor hidden">
-        <video id="remoteVideo" autoplay playsinline></video>
+        <video id="remoteVideo" autoplay muted playsinline></video>
+        <audio id="remoteAudio" playsinline preload="auto" aria-hidden="true"></audio>
         <div id="remotePlaceholder" class="remote-placeholder">
           <div class="spinner" aria-hidden="true"></div>
           <h1 id="remoteTitle">Connessione in corso…</h1>
@@ -104,7 +105,7 @@
           <div id="mediaBadge" class="pill">In attesa del video</div>
         </div>
         <div class="monitor-controls">
-          <button id="audioButton" class="control-button" type="button"><span aria-hidden="true">◖</span><span id="audioButtonText">Attiva audio</span></button>
+          <button id="audioButton" class="control-button" type="button" aria-pressed="false" disabled><span aria-hidden="true">◖</span><span id="audioButtonText">Audio in attesa</span></button>
           <button id="fullscreenButton" class="control-button" type="button"><span aria-hidden="true">⛶</span>Schermo intero</button>
           <button class="control-button danger" data-action="end-session" type="button"><span aria-hidden="true">■</span>Termina</button>
         </div>

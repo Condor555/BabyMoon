@@ -4,7 +4,19 @@
 
 BabyMoon trasforma due telefoni in un baby monitor privato nel browser. Il telefono **Baby** acquisisce fotocamera e microfono; il telefono **Parent** riceve il flusso tramite WebRTC. Il server gestisce soltanto pairing e signaling: non registra né archivia audio o video.
 
-## Novità V1.0.3 — P2P + STUN
+## Novità V1.0.4 — riproduzione audio Parent
+
+Questa release mantiene il flusso STUN/P2P della V1.0.3 e corregge la riproduzione audio sul Parent:
+
+- l’audio remoto usa un elemento `<audio>` dedicato, separato dal video sempre silenziato;
+- **Attiva audio** invoca `play()` direttamente dal tocco dell’utente, come richiesto da iOS/Safari;
+- il pulsante resta in attesa finché non esiste una traccia audio remota live;
+- dopo una riconnessione BabyMoon prova a ripristinare l’audio già richiesto dall’utente;
+- la diagnostica mostra i byte realmente ricevuti per audio e video;
+- il Baby verifica che il browser abbia restituito una traccia microfono valida e attiva;
+- cache PWA aggiornata a `babymoon-v1.0.4`.
+
+## Flusso P2P + STUN introdotto in V1.0.3
 
 Questa release riscrive il percorso di negoziazione che poteva lasciare il Parent su `WebRTC: new`:
 
@@ -18,7 +30,7 @@ Questa release riscrive il percorso di negoziazione che poteva lasciare il Paren
 - STUN pubblico configurato dal backend;
 - diagnostica separata per signaling, ICE, candidati e media realmente ricevuti;
 - identificazione del percorso selezionato: **Diretta P2P** oppure **Relay TURN**;
-- cache PWA aggiornata a `babymoon-v1.0.3`.
+- cache PWA versionata per evitare asset obsoleti dopo il deploy.
 
 ## Flusso
 
@@ -29,7 +41,7 @@ Questa release riscrive il percorso di negoziazione che poteva lasciare il Paren
 5. Entrambi raccolgono candidati host/STUN e cercano un percorso diretto.
 6. Se la connessione cade, BabyMoon ritenta con backoff `0 / 2 / 5 / 10 / 30 / 60 s`.
 
-> Il Parent non deve concedere fotocamera o microfono: riceve soltanto. Su iOS/Safari può essere necessario premere **Attiva audio** per soddisfare le regole di autoplay.
+> Il Parent non deve concedere fotocamera o microfono: riceve soltanto. Premi **Attiva audio** dopo che il pulsante diventa disponibile; il tocco sblocca l’uscita sonora su iOS/Safari.
 
 ## ICE e STUN
 
@@ -43,7 +55,7 @@ stun:stun1.l.google.com:19302
 
 STUN aiuta i dispositivi a scoprire i propri indirizzi pubblici, ma non inoltra il video. Il media resta peer-to-peer quando ICE seleziona un candidate pair diretto.
 
-**Limite importante:** STUN non può attraversare ogni NAT o firewall. Se la diagnostica mostra candidati locali/remoti ma ICE termina in `failed`, alcune combinazioni di rete richiedono un relay TURN. La V1.0.3 accetta TURN autenticato tramite variabili d’ambiente, ma non lo abilita né genera costi automaticamente.
+**Limite importante:** STUN non può attraversare ogni NAT o firewall. Se la diagnostica mostra candidati locali/remoti ma ICE termina in `failed`, alcune combinazioni di rete richiedono un relay TURN. La V1.0.4 accetta TURN autenticato tramite variabili d’ambiente, ma non lo abilita né genera costi automaticamente.
 
 ## Avvio locale
 
@@ -110,6 +122,7 @@ Verifica anche:
 
 - video Parent;
 - pulsante **Attiva audio**;
+- incremento dei byte `audio` nella sezione **Diagnostica → Media**;
 - cambio camera Baby;
 - **Oscura** e tocco per riattivare;
 - **Termina** da entrambi i dispositivi;
@@ -147,7 +160,8 @@ BabyMoon è un progetto sperimentale, non un dispositivo medico o di sicurezza c
 │   └── icon.svg
 ├── test/
 │   ├── server.test.js
-│   └── client.contract.test.js
+│   ├── client.contract.test.js
+│   └── client.audio.runtime.test.js
 ├── .github/workflows/ci.yml
 ├── render.yaml
 ├── Dockerfile

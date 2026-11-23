@@ -1,7 +1,7 @@
 'use strict';
 
-const CACHE_NAME = 'babymoon-v1.0.3';
-const SHELL = ['/', '/app.css?v=1.0.3', '/app.js?v=1.0.3', '/manifest.json?v=1.0.3', '/icon.svg'];
+const CACHE_NAME = 'babymoon-v1.0.4';
+const SHELL = ['/', '/app.css?v=1.0.4', '/app.js?v=1.0.4', '/manifest.json?v=1.0.4', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL)));

@@ -106,7 +106,7 @@ function createBabyMoonServer(options = {}) {
   app.use(express.json({ limit: '16kb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, name: 'BabyMoon', version: '1.0.3' });
+    res.json({ ok: true, name: 'BabyMoon', version: '1.0.4' });
   });
 
   app.get('/api/ice-config', (_req, res) => {
@@ -429,7 +429,7 @@ if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
   const instance = createBabyMoonServer();
   instance.server.listen(port, '0.0.0.0', () => {
-    console.log(`BabyMoon 1.0.3 listening on http://0.0.0.0:${port}`);
+    console.log(`BabyMoon 1.0.4 listening on http://0.0.0.0:${port}`);
   });
 }
 

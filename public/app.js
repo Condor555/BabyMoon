@@ -1,7 +1,7 @@
 'use strict';
 
 (() => {
-  const VERSION = '1.0.3';
+  const VERSION = '1.0.4';
   const STORAGE_KEY = 'babymoon:active-session';
   const RETRY_DELAYS = [0, 2_000, 5_000, 10_000, 30_000, 60_000];
   const CONNECTION_TIMEOUT_MS = 20_000;
@@ -25,6 +25,7 @@
     pairError: $('pairError'),
     localVideo: $('localVideo'),
     remoteVideo: $('remoteVideo'),
+    remoteAudio: $('remoteAudio'),
     remotePlaceholder: $('remotePlaceholder'),
     remoteTitle: $('remoteTitle'),
     remoteMessage: $('remoteMessage'),
@@ -62,6 +63,7 @@
     directJoin: null,
     localStream: null,
     remoteStream: new MediaStream(),
+    remoteAudioStream: new MediaStream(),
     pc: null,
     iceConfig: {
       iceServers: [
@@ -84,7 +86,10 @@
     statsTimer: null,
     wakeLock: null,
     facingMode: 'environment',
-    mediaReceived: { audio: false, video: false }
+    mediaReceived: { audio: false, video: false },
+    inboundBytes: { audio: 0, video: 0 },
+    audioRequested: false,
+    audioPlaying: false
   };
 
   function showView(view) {
@@ -232,6 +237,13 @@
       throw new Error(`Impossibile avviare fotocamera e microfono: ${error.message}`);
     }
     elements.localVideo.srcObject = state.localStream;
+    const audioTrack = state.localStream.getAudioTracks()[0];
+    if (!audioTrack) {
+      stopLocalMedia();
+      throw new Error('Il microfono non ha fornito una traccia audio. Controlla i permessi e riprova.');
+    }
+    audioTrack.enabled = true;
+    if ('contentHint' in audioTrack) audioTrack.contentHint = 'speech';
     await elements.localVideo.play().catch(() => {});
   }
 
@@ -292,8 +304,7 @@
       state.directJoin = null;
       showView(elements.parentView);
       setParentPlaceholder('Connessione in corso…', 'Il telefono Baby sta preparando il flusso P2P.');
-      elements.remoteVideo.muted = true;
-      elements.audioButtonText.textContent = 'Attiva audio';
+      resetParentAudio({ forgetPreference: true });
       setConnection('Negoziazione P2P…', 'connecting');
     } catch (error) {
       elements.pairError.textContent = error.message;
@@ -354,6 +365,7 @@
     state.localCandidates = 0;
     state.remoteCandidates = 0;
     state.mediaReceived = { audio: false, video: false };
+    state.inboundBytes = { audio: 0, video: 0 };
     state.pc = new RTCPeerConnection(peerConfiguration());
 
     if (state.mode === 'baby') {
@@ -361,7 +373,14 @@
       for (const track of state.localStream.getTracks()) state.pc.addTrack(track, state.localStream);
     } else {
       state.remoteStream = new MediaStream();
+      state.remoteAudioStream = new MediaStream();
       elements.remoteVideo.srcObject = state.remoteStream;
+      elements.remoteVideo.muted = true;
+      elements.remoteVideo.defaultMuted = true;
+      elements.remoteAudio.srcObject = state.remoteAudioStream;
+      elements.remoteAudio.muted = true;
+      state.audioPlaying = false;
+      updateAudioControl();
       state.pc.addTransceiver('video', { direction: 'recvonly' });
       state.pc.addTransceiver('audio', { direction: 'recvonly' });
     }
@@ -383,12 +402,10 @@
       if (state.mode !== 'parent') return;
       const stream = event.streams?.[0];
       const track = event.track;
-      if (stream) {
-        for (const remoteTrack of stream.getTracks()) {
-          if (!state.remoteStream.getTracks().some((item) => item.id === remoteTrack.id)) state.remoteStream.addTrack(remoteTrack);
-        }
-      } else if (!state.remoteStream.getTracks().some((item) => item.id === track.id)) {
-        state.remoteStream.addTrack(track);
+      const tracks = stream ? stream.getTracks() : [track];
+      for (const remoteTrack of tracks) {
+        const targetStream = remoteTrack.kind === 'audio' ? state.remoteAudioStream : state.remoteStream;
+        if (!targetStream.getTracks().some((item) => item.id === remoteTrack.id)) targetStream.addTrack(remoteTrack);
       }
       // ontrack means that the SDP negotiated a track; it does not prove that
       // packets or decoded frames are flowing yet. Keep the placeholder visible
@@ -400,10 +417,15 @@
       };
       track.onended = () => {
         state.mediaReceived[track.kind] = false;
+        if (track.kind === 'audio') state.audioPlaying = false;
         updateMediaDiagnostics();
+        updateAudioControl();
       };
       elements.remoteVideo.srcObject = state.remoteStream;
+      elements.remoteAudio.srcObject = state.remoteAudioStream;
       elements.remoteVideo.play().catch(() => {});
+      updateAudioControl();
+      if (track.kind === 'audio' && state.audioRequested) startRemoteAudio(false);
     };
     state.pc.onconnectionstatechange = handleConnectionState;
     state.pc.oniceconnectionstatechange = handleConnectionState;
@@ -528,9 +550,12 @@
   function markMediaActive(kind) {
     state.mediaReceived[kind] = true;
     updateMediaDiagnostics();
-    if (kind === 'video' && state.mode === 'parent') {
-      elements.remotePlaceholder.classList.add('hidden');
-      elements.mediaBadge.textContent = state.mediaReceived.audio ? 'Video + audio ricevuti' : 'Video ricevuto';
+    updateAudioControl();
+    if (state.mode === 'parent') {
+      if (state.mediaReceived.video) elements.remotePlaceholder.classList.add('hidden');
+      elements.mediaBadge.textContent = state.mediaReceived.video
+        ? (state.mediaReceived.audio ? 'Video + audio ricevuti' : 'Video ricevuto')
+        : (state.mediaReceived.audio ? 'Audio ricevuto' : 'P2P connesso');
     }
   }
 
@@ -538,7 +563,17 @@
     const received = [];
     if (state.mediaReceived.video) received.push('video');
     if (state.mediaReceived.audio) received.push('audio');
-    elements.diagMedia.textContent = received.length ? received.join(' + ') : 'In attesa';
+    const traffic = [];
+    if (state.inboundBytes.video) traffic.push(`video ${formatBytes(state.inboundBytes.video)}`);
+    if (state.inboundBytes.audio) traffic.push(`audio ${formatBytes(state.inboundBytes.audio)}`);
+    const status = received.length ? received.join(' + ') : 'In attesa';
+    elements.diagMedia.textContent = traffic.length ? `${status} · ${traffic.join(' · ')}` : status;
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   function startConnectionTimeout(negotiationId) {
@@ -617,8 +652,13 @@
     if (state.remoteStream) {
       for (const track of state.remoteStream.getTracks()) track.stop();
     }
+    if (state.remoteAudioStream) {
+      for (const track of state.remoteAudioStream.getTracks()) track.stop();
+    }
     state.remoteStream = new MediaStream();
+    state.remoteAudioStream = new MediaStream();
     elements.remoteVideo.srcObject = null;
+    resetParentAudio({ forgetPreference: true });
   }
 
   async function endSession() {
@@ -648,6 +688,7 @@
     state.peerPresent = false;
     state.retryAttempt = 0;
     state.mediaReceived = { audio: false, video: false };
+    state.inboundBytes = { audio: 0, video: 0 };
     state.directJoin = null;
     history.replaceState({}, '', location.pathname);
     showView(elements.homeView);
@@ -680,19 +721,72 @@
     }
   }
 
-  async function toggleAudio() {
-    if (state.mode !== 'parent') return;
-    const enable = elements.remoteVideo.muted;
-    elements.remoteVideo.muted = !enable;
-    try {
-      await elements.remoteVideo.play();
-      elements.audioButtonText.textContent = enable ? 'Disattiva audio' : 'Attiva audio';
-      toast(enable ? 'Audio attivato' : 'Audio disattivato');
-    } catch (_error) {
-      elements.remoteVideo.muted = true;
-      elements.audioButtonText.textContent = 'Attiva audio';
-      toast('Tocca di nuovo per consentire la riproduzione audio.');
+  function updateAudioControl() {
+    const available = Boolean(state.remoteAudioStream?.getAudioTracks().some((track) => track.readyState === 'live'));
+    elements.audioButton.disabled = !available;
+    elements.audioButton.setAttribute('aria-pressed', String(state.audioPlaying));
+    elements.audioButtonText.textContent = !available
+      ? 'Audio in attesa'
+      : (state.audioPlaying ? 'Disattiva audio' : 'Attiva audio');
+  }
+
+  function resetParentAudio({ forgetPreference = false } = {}) {
+    elements.remoteVideo.muted = true;
+    elements.remoteVideo.defaultMuted = true;
+    elements.remoteAudio.pause();
+    elements.remoteAudio.muted = true;
+    elements.remoteAudio.defaultMuted = true;
+    elements.remoteAudio.srcObject = null;
+    state.audioPlaying = false;
+    if (forgetPreference) state.audioRequested = false;
+    updateAudioControl();
+  }
+
+  function startRemoteAudio(fromUserGesture) {
+    const hasLiveTrack = state.remoteAudioStream?.getAudioTracks().some((track) => track.readyState === 'live');
+    if (!hasLiveTrack) {
+      if (fromUserGesture) toast('La traccia audio non è ancora disponibile. Riprova tra un istante.');
+      updateAudioControl();
+      return;
     }
+    elements.remoteAudio.srcObject = state.remoteAudioStream;
+    elements.remoteAudio.defaultMuted = false;
+    elements.remoteAudio.muted = false;
+    elements.remoteAudio.volume = 1;
+    // This call must run synchronously inside the tap handler on iOS/Safari.
+    const playback = elements.remoteAudio.play();
+    if (!playback?.then) {
+      state.audioPlaying = true;
+      updateAudioControl();
+      return;
+    }
+    playback.then(() => {
+      state.audioPlaying = true;
+      updateAudioControl();
+      if (fromUserGesture) toast('Audio attivato');
+    }).catch((error) => {
+      console.warn('Remote audio playback blocked', error);
+      elements.remoteAudio.muted = true;
+      state.audioPlaying = false;
+      state.audioRequested = false;
+      updateAudioControl();
+      toast('Il browser ha bloccato l’audio. Tocca di nuovo “Attiva audio”.');
+    });
+  }
+
+  function toggleAudio() {
+    if (state.mode !== 'parent') return;
+    if (state.audioPlaying) {
+      state.audioRequested = false;
+      state.audioPlaying = false;
+      elements.remoteAudio.pause();
+      elements.remoteAudio.muted = true;
+      updateAudioControl();
+      toast('Audio disattivato');
+      return;
+    }
+    state.audioRequested = true;
+    startRemoteAudio(true);
   }
 
   async function toggleFullscreen() {
@@ -741,7 +835,15 @@
       reports.forEach((report) => {
         if (report.type === 'transport' && report.selectedCandidatePairId) transport = report;
         if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) selectedPair = report;
+        if (report.type === 'inbound-rtp' && !report.isRemote) {
+          const kind = report.kind || report.mediaType;
+          if ((kind === 'audio' || kind === 'video') && Number(report.bytesReceived) > 0) {
+            state.inboundBytes[kind] = Number(report.bytesReceived);
+            if (!state.mediaReceived[kind]) markMediaActive(kind);
+          }
+        }
       });
+      updateMediaDiagnostics();
       if (transport) selectedPair = reports.get(transport.selectedCandidatePairId) || selectedPair;
       if (!selectedPair) return;
       const local = reports.get(selectedPair.localCandidateId);
@@ -817,6 +919,15 @@
     });
     elements.audioButton.addEventListener('click', toggleAudio);
     elements.remoteVideo.addEventListener('playing', () => markMediaActive('video'));
+    elements.remoteAudio.addEventListener('playing', () => {
+      state.audioPlaying = true;
+      markMediaActive('audio');
+      updateAudioControl();
+    });
+    elements.remoteAudio.addEventListener('pause', () => {
+      state.audioPlaying = false;
+      updateAudioControl();
+    });
     elements.fullscreenButton.addEventListener('click', toggleFullscreen);
     elements.diagnosticsToggle.addEventListener('click', () => elements.diagnosticsBody.classList.toggle('hidden'));
     document.addEventListener('click', (event) => {
@@ -828,6 +939,7 @@
       if (document.visibilityState === 'visible') {
         requestWakeLock();
         if (state.mode === 'parent' && state.remoteVideo.srcObject) elements.remoteVideo.play().catch(() => {});
+        if (state.mode === 'parent' && state.audioRequested) startRemoteAudio(false);
         if (state.pc && ['failed', 'disconnected'].includes(state.pc.connectionState)) retryNow();
       }
     });
