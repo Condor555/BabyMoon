@@ -1,14 +1,16 @@
 {
   "name": "babymoon",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "private": true,
-  "description": "Baby monitor PWA peer-to-peer con rilevamento locale di possibile pianto e movimento",
+  "description": "Baby monitor PWA peer-to-peer con rilevamento locale e controlli audio anti-rimbombo.",
+  "main": "server.js",
   "type": "commonjs",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test test/*.test.js",
     "check": "node --check server.js && node --check public/app.js && node --check public/detectors.js && node --check public/sw.js && npm test"
   },
   "dependencies": {
@@ -16,5 +18,8 @@
     "helmet": "8.1.0",
     "qrcode": "1.5.4",
     "socket.io": "4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "4.8.1"
   }
 }

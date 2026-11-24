@@ -2,18 +2,13 @@
   "name": "BabyMoon",
   "short_name": "BabyMoon",
   "description": "Sempre vicino, anche durante il sonno.",
-  "id": "/",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "orientation": "portrait",
-  "background_color": "#050915",
-  "theme_color": "#070b16",
-  "lang": "it",
-  "categories": ["lifestyle", "utilities"],
+  "background_color": "#080d19",
+  "theme_color": "#080d19",
+  "orientation": "any",
   "icons": [
-    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
-    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
-    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
   ]
 }

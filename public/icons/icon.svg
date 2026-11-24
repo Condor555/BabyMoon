@@ -1,6 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <defs><linearGradient id="b" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#111a33"/><stop offset="1" stop-color="#050915"/></linearGradient><linearGradient id="m" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#fff2ad"/><stop offset=".58" stop-color="#b59cff"/><stop offset="1" stop-color="#6dd5fa"/></linearGradient></defs>
-  <rect width="512" height="512" rx="112" fill="url(#b)"/>
-  <circle cx="392" cy="108" r="12" fill="#fff2ad"/><circle cx="112" cy="146" r="7" fill="#6dd5fa" opacity=".8"/><circle cx="420" cy="306" r="6" fill="#b59cff"/>
-  <path d="M340 349c-87 43-191-19-191-117 0-62 43-114 101-128-18 20-28 47-28 76 0 65 53 118 118 118 24 0 47-8 65-20-12 30-35 55-65 71Z" fill="url(#m)"/>
+  <rect width="512" height="512" rx="116" fill="#080d19"/>
+  <circle cx="265" cy="246" r="150" fill="#8c7cff"/>
+  <circle cx="335" cy="188" r="150" fill="#080d19"/>
+  <circle cx="138" cy="120" r="9" fill="#5de0cf"/>
+  <circle cx="393" cy="360" r="12" fill="#f7cc66"/>
+  <circle cx="119" cy="350" r="6" fill="#fff"/>
 </svg>

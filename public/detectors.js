@@ -1,172 +1,139 @@
-(function (root, factory) {
-  const api = factory();
-  if (typeof module === 'object' && module.exports) module.exports = api;
-  else root.BabyMoonDetectors = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+(() => {
   'use strict';
 
-  const CRY_PROFILES = {
-    low: { minRms: 0.07, minHighRatio: 0.18, needed: 6 },
-    medium: { minRms: 0.04, minHighRatio: 0.15, needed: 5 },
-    high: { minRms: 0.025, minHighRatio: 0.12, needed: 4 }
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const thresholds = {
+    low: { cryRms: 0.12, cryHold: 1900, motionDiff: 30, motionRatio: 0.12 },
+    medium: { cryRms: 0.078, cryHold: 1400, motionDiff: 22, motionRatio: 0.085 },
+    high: { cryRms: 0.048, cryHold: 950, motionDiff: 15, motionRatio: 0.055 }
   };
 
-  const MOTION_PROFILES = {
-    low: { pixelDelta: 30, changedRatio: 0.065 },
-    medium: { pixelDelta: 22, changedRatio: 0.035 },
-    high: { pixelDelta: 16, changedRatio: 0.018 }
-  };
-
-  function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
-
-  function audioFeatures(timeData, frequencyData, sampleRate) {
-    if (!timeData || !timeData.length) return { rms: 0, highRatio: 0 };
-    let square = 0;
-    for (let i = 0; i < timeData.length; i += 1) {
-      const value = (timeData[i] - 128) / 128;
-      square += value * value;
+  class CryDetector {
+    constructor(stream, onDetect) {
+      this.stream = stream;
+      this.onDetect = onDetect;
+      this.context = null;
+      this.analyser = null;
+      this.timer = null;
+      this.enabled = true;
+      this.sensitivity = 'medium';
+      this.activeMs = 0;
+      this.lastDetection = 0;
     }
-    const rms = Math.sqrt(square / timeData.length);
-    let total = 0;
-    let cryBand = 0;
-    const nyquist = sampleRate / 2;
-    for (let i = 0; i < frequencyData.length; i += 1) {
-      const power = frequencyData[i] * frequencyData[i];
-      const hz = (i / frequencyData.length) * nyquist;
-      if (hz >= 100 && hz <= 8000) total += power;
-      if (hz >= 450 && hz <= 4200) cryBand += power;
-    }
-    return { rms, highRatio: total ? cryBand / total : 0 };
-  }
-
-  class CryHeuristic {
-    constructor() { this.history = []; }
-    reset() { this.history.length = 0; }
-    process(features, sensitivity) {
-      const profile = CRY_PROFILES[sensitivity] || CRY_PROFILES.medium;
-      const positive = features.rms >= profile.minRms && features.highRatio >= profile.minHighRatio;
-      const energyScore = clamp(features.rms / (profile.minRms * 2.3), 0, 1);
-      const bandScore = clamp(features.highRatio / (profile.minHighRatio * 1.8), 0, 1);
-      this.history.push({ positive, score: (energyScore + bandScore) / 2 });
-      if (this.history.length > 8) this.history.shift();
-      const positiveWindows = this.history.filter(item => item.positive);
-      if (positiveWindows.length < profile.needed) return null;
-      const confidence = positiveWindows.reduce((sum, item) => sum + item.score, 0) / positiveWindows.length;
-      this.reset();
-      return { detected: true, confidence: clamp(confidence, 0.35, 0.99) };
-    }
-  }
-
-  function motionFeatures(previous, current, sensitivity) {
-    const profile = MOTION_PROFILES[sensitivity] || MOTION_PROFILES.medium;
-    if (!previous || !current || previous.length !== current.length) return { detected: false, changedRatio: 0, confidence: 0 };
-    let changed = 0;
-    const pixels = Math.floor(current.length / 4);
-    for (let i = 0; i < current.length; i += 4) {
-      const before = previous[i] * 0.299 + previous[i + 1] * 0.587 + previous[i + 2] * 0.114;
-      const after = current[i] * 0.299 + current[i + 1] * 0.587 + current[i + 2] * 0.114;
-      if (Math.abs(after - before) >= profile.pixelDelta) changed += 1;
-    }
-    const changedRatio = pixels ? changed / pixels : 0;
-    return {
-      detected: changedRatio >= profile.changedRatio,
-      changedRatio,
-      confidence: clamp(changedRatio / (profile.changedRatio * 3), 0, 0.99)
-    };
-  }
-
-  class DetectorController {
-    constructor(options) {
-      this.video = options.video;
-      this.stream = options.stream;
-      this.onDetection = options.onDetection;
-      this.onStatus = options.onStatus || function () {};
-      this.settings = options.settings;
-      this.cry = new CryHeuristic();
-      this.audioContext = null;
-      this.audioTimer = null;
-      this.motionTimer = null;
-      this.previousFrame = null;
-      this.lastDetectionAt = { cry: 0, motion: 0 };
-      this.canvas = document.createElement('canvas');
-      this.canvas.width = 160;
-      this.canvas.height = 90;
-      this.context = this.canvas.getContext('2d', { willReadFrequently: true });
-    }
-
-    update(settings) { this.settings = settings; }
 
     async start() {
-      this.stop();
-      await this.startAudio();
-      this.startMotion();
+      if (!AudioContextClass || this.timer) return;
+      const tracks = this.stream && this.stream.getAudioTracks();
+      if (!tracks || !tracks.length) return;
+      this.context = new AudioContextClass();
+      const source = this.context.createMediaStreamSource(new MediaStream([tracks[0]]));
+      this.analyser = this.context.createAnalyser();
+      this.analyser.fftSize = 2048;
+      this.analyser.smoothingTimeConstant = 0.72;
+      source.connect(this.analyser);
+      await this.context.resume().catch(() => {});
+      this.timer = window.setInterval(() => this.sample(), 200);
     }
 
-    async startAudio() {
-      if (!this.settings.cryEnabled || !this.stream.getAudioTracks().length) {
-        this.onStatus('cry', 'disabled');
+    sample() {
+      if (!this.enabled || !this.analyser) {
+        this.activeMs = 0;
         return;
       }
-      try {
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        this.audioContext = new AudioContextClass();
-        await this.audioContext.resume();
-        const source = this.audioContext.createMediaStreamSource(this.stream);
-        const analyser = this.audioContext.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.35;
-        source.connect(analyser);
-        const timeData = new Uint8Array(analyser.fftSize);
-        const frequencyData = new Uint8Array(analyser.frequencyBinCount);
-        this.audioTimer = setInterval(() => {
-          if (!this.settings.cryEnabled) return;
-          analyser.getByteTimeDomainData(timeData);
-          analyser.getByteFrequencyData(frequencyData);
-          const result = this.cry.process(audioFeatures(timeData, frequencyData, this.audioContext.sampleRate), this.settings.crySensitivity);
-          if (result) this.emit('cry', result.confidence);
-        }, 250);
-        this.onStatus('cry', 'active');
-      } catch (error) {
-        this.onStatus('cry', 'error');
+      const data = new Float32Array(this.analyser.fftSize);
+      this.analyser.getFloatTimeDomainData(data);
+      let sum = 0;
+      let crossings = 0;
+      for (let i = 1; i < data.length; i += 1) {
+        sum += data[i] * data[i];
+        if ((data[i] >= 0) !== (data[i - 1] >= 0)) crossings += 1;
+      }
+      const rms = Math.sqrt(sum / data.length);
+      const zcr = crossings / data.length;
+      const rule = thresholds[this.sensitivity] || thresholds.medium;
+      const voiceLike = zcr > 0.015 && zcr < 0.32;
+      this.activeMs = rms >= rule.cryRms && voiceLike
+        ? this.activeMs + 200
+        : Math.max(0, this.activeMs - 300);
+      if (this.activeMs >= rule.cryHold && Date.now() - this.lastDetection > 6000) {
+        this.lastDetection = Date.now();
+        this.activeMs = 0;
+        this.onDetect(Math.min(1, rms / Math.max(rule.cryRms, 0.001)));
       }
     }
 
-    startMotion() {
-      if (!this.settings.motionEnabled || !this.stream.getVideoTracks().length) {
-        this.onStatus('motion', 'disabled');
-        return;
-      }
-      this.motionTimer = setInterval(() => {
-        if (!this.settings.motionEnabled || !this.video.videoWidth) return;
-        try {
-          this.context.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
-          const frame = this.context.getImageData(0, 0, this.canvas.width, this.canvas.height).data;
-          const result = motionFeatures(this.previousFrame, frame, this.settings.motionSensitivity);
-          this.previousFrame = new Uint8ClampedArray(frame);
-          if (result.detected) this.emit('motion', result.confidence);
-        } catch (_) {}
-      }, 350);
-      this.onStatus('motion', 'active');
+    configure({ enabled, sensitivity } = {}) {
+      if (typeof enabled === 'boolean') this.enabled = enabled;
+      if (thresholds[sensitivity]) this.sensitivity = sensitivity;
     }
 
-    emit(type, confidence) {
-      const cooldown = (type === 'cry' ? this.settings.cryCooldown : this.settings.motionCooldown) * 1000;
-      if (Date.now() - this.lastDetectionAt[type] < cooldown) return;
-      this.lastDetectionAt[type] = Date.now();
-      this.onDetection({ type, confidence });
+    async stop() {
+      clearInterval(this.timer);
+      this.timer = null;
+      if (this.context) await this.context.close().catch(() => {});
+      this.context = null;
+      this.analyser = null;
+    }
+  }
+
+  class MotionDetector {
+    constructor(video, onDetect) {
+      this.video = video;
+      this.onDetect = onDetect;
+      this.canvas = document.createElement('canvas');
+      this.canvas.width = 64;
+      this.canvas.height = 48;
+      this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+      this.previous = null;
+      this.timer = null;
+      this.enabled = true;
+      this.sensitivity = 'medium';
+      this.lastDetection = 0;
+    }
+
+    start() {
+      if (!this.ctx || this.timer) return;
+      this.timer = window.setInterval(() => this.sample(), 700);
+    }
+
+    sample() {
+      if (!this.enabled || !this.video || this.video.readyState < 2) return;
+      this.ctx.drawImage(this.video, 0, 0, 64, 48);
+      const pixels = this.ctx.getImageData(0, 0, 64, 48).data;
+      const frame = new Uint8Array(64 * 48);
+      for (let i = 0, p = 0; i < pixels.length; i += 4, p += 1) {
+        frame[p] = (pixels[i] * 0.299 + pixels[i + 1] * 0.587 + pixels[i + 2] * 0.114) | 0;
+      }
+      if (this.previous) {
+        const rule = thresholds[this.sensitivity] || thresholds.medium;
+        let changed = 0;
+        let total = 0;
+        for (let i = 0; i < frame.length; i += 2) {
+          const diff = Math.abs(frame[i] - this.previous[i]);
+          total += diff;
+          if (diff >= rule.motionDiff) changed += 1;
+        }
+        const ratio = changed / (frame.length / 2);
+        const brightnessShift = total / (frame.length / 2);
+        if (ratio >= rule.motionRatio && brightnessShift < 60 && Date.now() - this.lastDetection > 4000) {
+          this.lastDetection = Date.now();
+          this.onDetect(Math.min(1, ratio / Math.max(rule.motionRatio, 0.001)));
+        }
+      }
+      this.previous = frame;
+    }
+
+    configure({ enabled, sensitivity } = {}) {
+      if (typeof enabled === 'boolean') this.enabled = enabled;
+      if (thresholds[sensitivity]) this.sensitivity = sensitivity;
     }
 
     stop() {
-      if (this.audioTimer) clearInterval(this.audioTimer);
-      if (this.motionTimer) clearInterval(this.motionTimer);
-      this.audioTimer = null;
-      this.motionTimer = null;
-      this.previousFrame = null;
-      this.cry.reset();
-      if (this.audioContext) this.audioContext.close().catch(function () {});
-      this.audioContext = null;
+      clearInterval(this.timer);
+      this.timer = null;
+      this.previous = null;
     }
   }
 
-  return { CRY_PROFILES, MOTION_PROFILES, CryHeuristic, audioFeatures, motionFeatures, DetectorController };
-});
+  window.BabyMoonDetectors = { CryDetector, MotionDetector };
+})();

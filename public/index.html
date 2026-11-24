@@ -3,21 +3,29 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#070b16">
-  <meta name="description" content="BabyMoon: baby monitor privato tra due telefoni, con analisi locale di possibile pianto e movimento.">
+  <meta name="theme-color" content="#080d19">
+  <meta name="description" content="BabyMoon: baby monitor P2P privato tra due telefoni.">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>BabyMoon — Sempre vicino, anche durante il sonno</title>
-  <link rel="manifest" href="/manifest.webmanifest">
+  <title>BabyMoon 🌙</title>
+  <link rel="manifest" href="/manifest.webmanifest?v=1.1.2">
   <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/styles.css?v=1.1.0">
+  <link rel="apple-touch-icon" href="/icons/icon.svg">
+  <link rel="stylesheet" href="/styles.css?v=1.1.2">
 </head>
 <body>
-  <noscript>BabyMoon richiede JavaScript.</noscript>
-  <main id="app" aria-live="polite"></main>
-  <div id="toast" class="toast" role="status" aria-live="assertive" hidden></div>
+  <header class="topbar">
+    <button class="brand" data-action="home" aria-label="Home BabyMoon">BabyMoon <span>🌙</span></button>
+    <div id="connectionBadge" class="badge neutral" aria-live="polite">Pronto</div>
+  </header>
+  <main id="app" class="app" aria-live="polite"></main>
+  <audio id="remoteAudio" playsinline preload="auto"></audio>
+  <div id="darkOverlay" class="dark-overlay hidden" role="button" tabindex="0" aria-label="Tocca per riattivare lo schermo">
+    <span>🌙</span><strong>Tocca per riattivare</strong>
+  </div>
+  <div id="toast" class="toast hidden" role="status" aria-live="assertive"></div>
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/detectors.js?v=1.1.0"></script>
-  <script src="/app.js?v=1.1.0"></script>
+  <script src="/detectors.js?v=1.1.2"></script>
+  <script src="/app.js?v=1.1.2"></script>
 </body>
 </html>
