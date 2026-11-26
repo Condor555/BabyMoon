@@ -1,71 +1,25 @@
-# BabyMoon 🌙
+# BabyMoon 1.2.0 🌙
 
-**Sempre vicino, anche durante il sonno.**
+BabyMoon trasforma due telefoni in un baby monitor privato. Il telefono **Baby** acquisisce camera e microfono; fino a **3 Parent** ricevono flussi WebRTC indipendenti. Il server gestisce solo sessioni, inviti e signaling: non registra audio, video o fotogrammi.
 
-BabyMoon trasforma un telefono Baby e fino a **3 telefoni Parent** in un baby monitor PWA. Il Baby è l'unica sorgente audio/video; ogni Parent riceve lo stream tramite una RTCPeerConnection WebRTC separata e autenticata.
+> BabyMoon non è un dispositivo medico o di sicurezza certificato e non sostituisce la supervisione di un adulto. I rilevatori locali possono produrre falsi positivi o negativi.
 
-> BabyMoon non sostituisce la supervisione di un adulto né un dispositivo medico o di sicurezza certificato. Il rilevamento del “possibile pianto” è euristico e può produrre falsi positivi o negativi.
+## Novità V1.2
 
-## Novità V1.1.2 cumulativa
+- interfaccia Parent riprogettata: video centrale, stato LIVE leggibile, controlli principali separati dalle impostazioni;
+- visione notturna software **Auto / Attiva / Disattiva**, basata sulla luminanza stimata dal Baby;
+- pairing tramite **QR inquadrato nell'app** o PIN a 6 cifre;
+- «Aggiungi Parent» disponibile sia sul Baby sia in **Parent → Impostazioni → Dispositivi**;
+- inviti temporanei di 5 minuti, monouso e revocabili, con rate limiting;
+- token privato distinto per ogni Parent e mai inserito nel QR/PIN di invito;
+- indicatore `n di 3 Parent` e slot disponibili;
+- installazione PWA completa su Android/Chromium e iPhone/iPad;
+- manifest completo, icone 192/512 normali e maskable, Apple touch icon, safe area e avvio standalone;
+- onboarding installazione non invasivo;
+- service worker aggiornabile che non intercetta signaling, API o WebRTC;
+- diagnostica estesa per peer, media, trasporto, inviti e luce.
 
-### Audio e anti-rimbombo (V1.1.1)
-
-- **Ascolto Parent ON/OFF** locale: silenzia solo quel Parent senza interrompere WebRTC.
-- **Microfono Baby ON/OFF** remoto e globale: lo stato è sincronizzato su tutti i Parent.
-- Se il microfono Baby è spento, il rilevamento del possibile pianto viene sospeso.
-- Vincoli audio richiesti al browser: `echoCancellation`, `noiseSuppression`, `autoGainControl`, mono.
-
-### Volume adattivo (V1.1.2)
-
-- Parte circa dal 55%.
-- Scende gradualmente fino al 22% durante audio continuativo.
-- Recupera lentamente fino al 70% quando il segnale si stabilizza.
-- È indipendente per ogni Parent e può essere disattivato tornando al volume normale.
-
-### Più Parent
-
-- Fino a **3 Parent autorizzati** nella stessa sessione.
-- QR/PIN accettano più Parent entro 5 minuti dalla creazione.
-- Token Parent distinti e crittograficamente casuali.
-- Una PeerConnection, negotiation ID, coda ICE, retry e cleanup separati per Parent.
-- L'ingresso, l'uscita o la riconnessione di un Parent non ricrea le connessioni degli altri.
-- Il Baby mostra il numero di Parent collegati.
-
-### Interruzione e riconnessione
-
-- **Interrompi** chiude solo il monitoraggio del Parent corrente.
-- Il Baby e gli altri Parent restano attivi.
-- Quel Parent può premere **Riconnetti** entro 30 secondi; in caso di perdita involontaria i tentativi sono automatici e controllati.
-- Non vengono mantenute PeerConnection sovrapposte.
-- Dopo il riaggancio tornano video, stato LIVE, ascolto precedente e volume adattivo.
-- Scaduti i 30 secondi, viene invalidato solo quel Parent.
-- **Termina sessione** è distinta e chiude definitivamente Baby e tutti i Parent, senza retry.
-
-## Funzioni
-
-- pairing QR o PIN;
-- WebRTC STUN/P2P con Baby unico offerer;
-- video e audio Baby → Parent;
-- riconnessione Socket.IO/WebRTC;
-- cambio fotocamera, modalità Oscura e Wake Lock;
-- rilevamento locale di possibile pianto e movimento;
-- sensibilità Bassa/Media/Alta, cooldown e timeline temporanea;
-- diagnostica ICE, WebRTC, percorso e byte ricevuti;
-- nessuna registrazione audio, video o immagine.
-
-## Architettura
-
-```text
-Baby (camera + mic + rilevatori)
- ├─ RTCPeerConnection dedicata ─ Parent 1
- ├─ RTCPeerConnection dedicata ─ Parent 2
- └─ RTCPeerConnection dedicata ─ Parent 3
-
-Node.js + Socket.IO: pairing autenticato, signaling e controlli
-WebRTC: media cifrati end-to-end sul percorso P2P
-```
-
-Il server conserva le sessioni solo in memoria. Un riavvio del servizio Render invalida le sessioni correnti.
+Sono mantenute le funzioni V1.1: audio Baby→Parent, Ascolto Parent, volume adattivo, controllo del microfono Baby, rilevamento locale di possibile pianto e movimento, timeline, multi-Parent, riconnessione entro 30 secondi, Wake Lock, modalità Oscura e terminazione sincronizzata.
 
 ## Avvio locale
 
@@ -73,42 +27,112 @@ Richiede Node.js 20 o successivo.
 
 ```bash
 npm install
-npm run check
 npm start
 ```
 
-Apri `http://localhost:3000`. Fotocamera e microfono richiedono `localhost` oppure HTTPS.
+Apri `http://localhost:3000`. Camera, microfono, service worker e installazione PWA richiedono un **secure context**: localhost è ammesso per sviluppo, su rete o produzione serve HTTPS.
 
-## Deploy su Render
-
-Il repository include `render.yaml`:
-
-1. collega la repository GitHub a un Blueprint Render;
-2. imposta `PUBLIC_URL` con l'URL HTTPS effettivo;
-3. esegui il deploy;
-4. dopo ogni aggiornamento chiudi e riapri la PWA sui telefoni per sostituire la cache.
-
-La configurazione usa STUN/P2P e non include TURN. Alcune combinazioni di NAT/firewall possono richiedere in futuro un relay TURN.
-
-## Test
+Controlli:
 
 ```bash
 npm run check
 ```
 
-La suite verifica sintassi, versione/cache PWA, contratti audio, separazione Interrompi/Termina, routing multi-Parent, limite di 3 Parent, stato globale del microfono, riconnessione e cleanup indipendente.
+## Deploy su Render
+
+Il file `render.yaml` crea un Web Service Node:
+
+1. carica tutti i file nella root della repository GitHub;
+2. in Render scegli **New → Blueprint** e collega la repository;
+3. lascia `render.yaml` nella root e avvia il deploy;
+4. Render esegue `npm install` e `npm start`, quindi verifica `/api/health`;
+5. apri l'URL HTTPS assegnato.
+
+`PUBLIC_URL` è opzionale. Se non impostata, i QR usano automaticamente protocollo e host della richiesta; in presenza di proxy inverso viene rispettato `X-Forwarded-Proto`.
+
+## Flussi principali
+
+### Avviare il Baby
+
+1. Apri BabyMoon e scegli **Resta con il bambino**.
+2. Consenti camera e microfono.
+3. Tocca **Aggiungi Parent** per mostrare QR e PIN.
+4. Dopo il collegamento puoi cambiare camera o oscurare lo schermo.
+
+### Collegare un Parent
+
+1. Scegli **Resta con me**.
+2. Tocca **Scansiona il QR** e inquadra il codice; se la scansione live non è disponibile, scegli una foto del QR o usa il PIN.
+3. Attiva l'audio con un tocco quando iOS/Safari lo richiede.
+
+Il QR contiene solo una credenziale di invito ad alta entropia, temporanea e monouso. Il PIN è il fallback breve. Dopo il consumo il server crea un nuovo `parentId` e un nuovo token privato per quel dispositivo.
+
+### Invitare da un Parent già collegato
+
+1. Apri **⚙ Impostazioni**.
+2. Vai a **Dispositivi**.
+3. Tocca **Aggiungi Parent**.
+4. Mostra il QR o condividi l'invito.
+
+Questa operazione non interrompe il Baby o gli altri Parent. Il pulsante viene disabilitato a 3/3. La credenziale privata del Parent che crea l'invito serve solo ad autenticare la richiesta Socket.IO e non compare nel QR, nel PIN o nel link condiviso.
+
+### Interrompere e riconnettere
+
+**Interrompi** chiude il peer di quel Parent e conserva per 30 secondi il diritto di riconnessione con lo stesso token. **Termina sessione**, disponibile sul Baby, invalida l'intera sessione e tutti gli inviti.
+
+## Visione notturna
+
+La modalità Auto misura sul Baby la luminanza di un fotogramma ridotto, senza salvarlo o inviarlo. Il Parent riceve solo il valore numerico e applica un filtro locale di luminosità/contrasto quando l'ambiente è buio.
+
+È un miglioramento software: non crea dettagli che il sensore non ha catturato e non equivale a una camera a infrarossi. Evitiamo di attivare automaticamente la torcia per non illuminare il bambino.
+
+## Installazione PWA
+
+### Android / Chrome / Edge
+
+Quando il browser rende l'app installabile e BabyMoon non è già standalone, appare un banner discreto **Installa BabyMoon**. Il pulsante usa `beforeinstallprompt`; `appinstalled` rimuove il banner. Se chiuso, il banner non ricompare per 7 giorni.
+
+### iPhone / iPad
+
+Apri BabyMoon in Safari, tocca **Condividi → Aggiungi alla schermata Home**. Le istruzioni appaiono solo su iOS/iPadOS, solo fuori dalla modalità standalone e senza prompt bloccanti.
+
+### Aggiornamenti
+
+Il service worker usa:
+
+- network-first per le navigazioni, con fallback alla shell offline;
+- stale-while-revalidate per asset statici versionati;
+- nessuna cache per `/socket.io/` e `/api/`;
+- pulizia automatica delle cache BabyMoon precedenti.
+
+Dopo una release, chiudi e riapri la PWA per usare la nuova shell. Camera/microfono, Socket.IO e WebRTC restano sempre online e non vengono simulati dalla cache.
 
 ## Privacy e sicurezza
 
-- PIN di 6 cifre valido 5 minuti;
-- massimo 5 tentativi errati prima del blocco temporaneo;
-- token Baby e Parent casuali e distinti;
-- signaling autorizzato per sessione/ruolo/Parent;
-- HTTPS obbligatorio in produzione;
-- header di sicurezza e CSP;
-- nessun segreto reale nel repository;
-- nessuna registrazione dei media.
+Vedi [SECURITY.md](SECURITY.md). In sintesi:
 
-## Licenza
+- nessuna registrazione server-side;
+- una `RTCPeerConnection` separata per ogni Parent;
+- massimo 3 Parent, inclusi quelli nella finestra di riconnessione;
+- token Baby e Parent casuali e confrontati in tempo costante;
+- inviti separati dai token di sessione, validi 5 minuti, monouso e revocabili;
+- rate limit su creazione e consumo degli inviti;
+- comandi audio/rilevatori e signaling autorizzati per sessione e socket;
+- HTTPS/HSTS in produzione, Permissions-Policy e header di sicurezza.
 
-MIT. Vedi [LICENSE](LICENSE).
+## Struttura
+
+```text
+server.js                 Express, Socket.IO, sessioni e inviti
+public/index.html         UI mobile-first e meta PWA/iOS
+public/styles.css         baseline visuale V1.1 + redesign Parent
+public/app.js             WebRTC, media, scanner QR, rilevatori e PWA
+public/sw.js              cache applicativa versionata
+public/manifest.webmanifest
+public/icons/             icone installabili e Apple touch icon
+tests/                    test contrattuali, PWA e sicurezza
+```
+
+## Diagnostica
+
+Nel Parent apri **Impostazioni → Diagnostica**. Sono mostrati versione, stato WebRTC, contatori media, trasporto Socket.IO, Parent/slot, inviti attivi e luminanza. Non vengono mostrati token o segreti.

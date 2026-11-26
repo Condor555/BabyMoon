@@ -1,14 +1,58 @@
 {
+  "id": "/",
   "name": "BabyMoon",
   "short_name": "BabyMoon",
-  "description": "Sempre vicino, anche durante il sonno.",
-  "start_url": "/",
+  "description": "Baby monitor privato P2P tra i tuoi dispositivi.",
+  "lang": "it-IT",
+  "dir": "ltr",
   "scope": "/",
+  "start_url": "/?source=pwa",
   "display": "standalone",
-  "background_color": "#080d19",
-  "theme_color": "#080d19",
+  "display_override": ["standalone", "minimal-ui"],
   "orientation": "any",
+  "theme_color": "#080d1d",
+  "background_color": "#070b18",
+  "categories": ["lifestyle", "utilities"],
   "icons": [
-    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Modalità Baby",
+      "short_name": "Baby",
+      "description": "Avvia il monitor sul dispositivo vicino al bambino",
+      "url": "/?mode=baby&source=shortcut",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Modalità Parent",
+      "short_name": "Parent",
+      "description": "Collegati a un BabyMoon",
+      "url": "/?mode=parent&source=shortcut",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
   ]
 }

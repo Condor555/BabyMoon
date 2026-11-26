@@ -1,27 +1,31 @@
 # Changelog
 
-## 1.1.2
+## 1.2.0
 
-- Aggiunto volume adattivo Parent (55% iniziale, 22–70% dinamico), indipendente per dispositivo.
-- Aggiunto supporto fino a 3 Parent contemporanei.
-- Aggiunti token Parent distinti e pairing QR/PIN multi-Parent entro la finestra di validità.
-- Separati PeerConnection, negotiation ID, ICE, retry e cleanup per ogni Parent.
-- Aggiunto contatore Parent sul Baby e diagnostica Parent.
-- `Interrompi` ora scollega solo quel Parent e conserva una finestra di riaggancio di 30 secondi.
-- Aggiunto `Riconnetti` esplicito e retry automatico per perdite involontarie.
-- Ripristinati dopo il riaggancio video, stato LIVE, ascolto precedente e volume adattivo.
-- `Termina sessione` resta definitiva per Baby e tutti i Parent e non avvia retry.
-- Aggiornati test, documentazione, cache PWA e configurazione CI/Render.
+### Aggiunto
 
-## 1.1.1
+- visione notturna software Auto/On/Off con stima locale della luminanza;
+- scansione QR live e da immagine nel flusso Parent;
+- invito di un nuovo Parent dal Baby o da Parent → Impostazioni → Dispositivi;
+- credenziali di invito temporanee, monouso e revocabili, separate dai token privati;
+- conteggio `n/3`, slot disponibili e diagnostica inviti;
+- UI Parent riorganizzata intorno a video, stato, azioni principali e impostazioni secondarie;
+- manifest PWA completo, icone installabili/maskable e Apple touch icon;
+- install prompt Android/Chromium e istruzioni contestuali iOS/iPadOS;
+- supporto standalone e safe area.
 
-- Aggiunti Ascolto Parent ON/OFF e Microfono Baby ON/OFF remoto.
-- Sincronizzato lo stato globale del microfono Baby.
-- Sospeso il rilevamento del possibile pianto quando il microfono Baby è spento.
-- Richiesti cancellazione eco, riduzione rumore, guadagno automatico e audio mono.
+### Sicurezza
 
-## 1.1.0
+- rate limiting per creazione e consumo degli inviti;
+- controllo autorizzazione per creator Baby/Parent;
+- consumo atomico e revoca degli inviti;
+- header HSTS, Permissions-Policy, no-referrer e nosniff;
+- esclusione di API e Socket.IO dalla cache del service worker.
 
-- Aggiunti rilevamento locale di possibile pianto e movimento.
-- Aggiunti sensibilità, cooldown, avvisi e timeline temporanea.
-- Mantenuta la baseline WebRTC STUN/P2P della V1.0.4.
+### Mantenuto
+
+- multi-Parent fino a 3 peer indipendenti;
+- riconnessione di 30 secondi anche dopo Interrompi;
+- audio separato per compatibilità iOS, ascolto locale, controllo microfono Baby e volume adattivo;
+- rilevamento locale di possibile pianto e movimento;
+- modalità Oscura, Wake Lock, terminazione sincronizzata, QR/PIN e HTTPS.

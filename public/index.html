@@ -3,29 +3,206 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="theme-color" content="#080d19">
-  <meta name="description" content="BabyMoon: baby monitor P2P privato tra due telefoni.">
+  <meta name="theme-color" content="#080d1d">
+  <meta name="description" content="BabyMoon trasforma due telefoni in un baby monitor privato.">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="BabyMoon">
+  <meta name="format-detection" content="telephone=no">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon-180.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
   <title>BabyMoon 🌙</title>
-  <link rel="manifest" href="/manifest.webmanifest?v=1.1.2">
-  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/icons/icon.svg">
-  <link rel="stylesheet" href="/styles.css?v=1.1.2">
 </head>
 <body>
-  <header class="topbar">
-    <button class="brand" data-action="home" aria-label="Home BabyMoon">BabyMoon <span>🌙</span></button>
-    <div id="connectionBadge" class="badge neutral" aria-live="polite">Pronto</div>
-  </header>
-  <main id="app" class="app" aria-live="polite"></main>
-  <audio id="remoteAudio" playsinline preload="auto"></audio>
-  <div id="darkOverlay" class="dark-overlay hidden" role="button" tabindex="0" aria-label="Tocca per riattivare lo schermo">
-    <span>🌙</span><strong>Tocca per riattivare</strong>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <button id="backButton" class="icon-button hidden" aria-label="Torna indietro">←</button>
+      <a class="brand" href="/" aria-label="BabyMoon home"><span class="brand-moon">☾</span><span>BabyMoon</span></a>
+      <div id="headerStatus" class="status-chip neutral"><span class="status-dot"></span><span>Pronto</span></div>
+    </header>
+
+    <main>
+      <section id="homeScreen" class="screen home-screen active" aria-labelledby="homeTitle">
+        <div class="hero">
+          <div class="moon-mark" aria-hidden="true">☾</div>
+          <p class="eyebrow">BABY MONITOR PRIVATO</p>
+          <h1 id="homeTitle">Due telefoni.<br>Più tranquillità.</h1>
+          <p class="lead">Video e audio in diretta tra i tuoi dispositivi, senza registrazioni.</p>
+        </div>
+        <div class="role-grid">
+          <button id="startBabyButton" class="role-card baby-card">
+            <span class="role-icon">👶</span>
+            <span class="role-copy"><strong>Resta con il bambino</strong><small>Usa fotocamera e microfono</small></span>
+            <span class="role-arrow">→</span>
+          </button>
+          <button id="startParentButton" class="role-card parent-card">
+            <span class="role-icon">📱</span>
+            <span class="role-copy"><strong>Resta con me</strong><small>Guarda e ascolta in diretta</small></span>
+            <span class="role-arrow">→</span>
+          </button>
+        </div>
+        <div class="privacy-note"><span>🔒</span><span><strong>Privato per progettazione.</strong> Nessun video o audio viene salvato.</span></div>
+      </section>
+
+      <section id="permissionsScreen" class="screen compact-screen" aria-labelledby="permissionsTitle">
+        <div class="section-heading">
+          <p class="eyebrow">MODALITÀ BABY</p>
+          <h1 id="permissionsTitle">Prepariamo questo telefono</h1>
+          <p>Posizionalo in modo stabile, lontano dalla portata del bambino.</p>
+        </div>
+        <div class="permission-list">
+          <div class="permission-row"><span>📷</span><div><strong>Fotocamera</strong><small>Per vedere il bambino.</small></div><span id="cameraPermission" class="permission-state">Da consentire</span></div>
+          <div class="permission-row"><span>🎙️</span><div><strong>Microfono</strong><small>Per ascoltare e rilevare un possibile pianto.</small></div><span id="micPermission" class="permission-state">Da consentire</span></div>
+        </div>
+        <button id="grantMediaButton" class="primary-button full">Consenti e continua</button>
+        <p id="permissionError" class="inline-error hidden" role="alert"></p>
+      </section>
+
+      <section id="babyScreen" class="screen monitor-screen" aria-labelledby="babyTitle">
+        <div class="monitor-heading">
+          <div><p class="eyebrow">MODALITÀ BABY</p><h1 id="babyTitle">Monitor attivo</h1></div>
+          <div id="babyParentCount" class="counter-pill">0 di 3 Parent</div>
+        </div>
+        <div id="babyVideoFrame" class="video-frame baby-video-frame">
+          <video id="localVideo" autoplay muted playsinline></video>
+          <div class="video-gradient"></div>
+          <div class="video-top-row"><span id="babyLiveBadge" class="live-badge waiting">IN ATTESA</span><span id="babyLightBadge" class="video-badge">Luce —</span></div>
+          <div class="video-bottom-row"><span id="babyMicBadge" class="video-badge">🎙️ Microfono attivo</span><span id="babyDetectorBadge" class="video-badge">Rilevatori attivi</span></div>
+          <button id="wakeDarkScreen" class="dark-screen-overlay hidden"><span>☾</span><strong>Monitor attivo</strong><small>Tocca per riattivare lo schermo</small></button>
+        </div>
+        <div class="primary-actions three-actions">
+          <button id="switchCameraButton" class="control-button"><span>↻</span><small>Cambia camera</small></button>
+          <button id="babyInviteButton" class="control-button accent"><span>＋</span><small>Aggiungi Parent</small></button>
+          <button id="darkScreenButton" class="control-button"><span>☾</span><small>Oscura</small></button>
+        </div>
+        <div class="session-card">
+          <div><strong id="babyConnectionTitle">In attesa del primo Parent</strong><small id="babyConnectionHint">Apri “Aggiungi Parent” per mostrare QR e PIN.</small></div>
+          <span class="pulse-dot"></span>
+        </div>
+        <button id="endSessionButton" class="danger-link">Termina sessione</button>
+      </section>
+
+      <section id="joinScreen" class="screen compact-screen" aria-labelledby="joinTitle">
+        <div class="section-heading">
+          <p class="eyebrow">MODALITÀ PARENT</p>
+          <h1 id="joinTitle">Collega BabyMoon</h1>
+          <p>Inquadra il QR mostrato su Baby o da un altro Parent, oppure inserisci il PIN.</p>
+        </div>
+        <button id="openScannerButton" class="scan-button"><span class="scan-icon">⌗</span><span><strong>Scansiona il QR</strong><small>Più veloce e sicuro</small></span><span>→</span></button>
+        <div class="separator"><span>oppure</span></div>
+        <form id="pinForm" class="pin-form">
+          <label for="pinInput">PIN a 6 cifre</label>
+          <input id="pinInput" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000 000" aria-describedby="joinError">
+          <button class="primary-button full" type="submit">Collega</button>
+        </form>
+        <p id="joinError" class="inline-error hidden" role="alert"></p>
+      </section>
+
+      <section id="parentScreen" class="screen monitor-screen parent-monitor" aria-labelledby="parentTitle">
+        <div class="monitor-heading parent-heading">
+          <div><p class="eyebrow">MONITOR</p><h1 id="parentTitle">BabyMoon</h1></div>
+          <button id="openSettingsButton" class="settings-button" aria-label="Apri impostazioni"><span>⚙</span></button>
+        </div>
+        <div id="parentVideoFrame" class="video-frame parent-video-frame night-auto">
+          <video id="remoteVideo" autoplay playsinline muted></video>
+          <audio id="remoteAudio" autoplay></audio>
+          <div class="video-gradient"></div>
+          <div class="video-top-row">
+            <span id="parentLiveBadge" class="live-badge waiting">CONNESSIONE</span>
+            <span id="nightBadge" class="video-badge hidden">☾ Visione notturna</span>
+          </div>
+          <div id="connectionOverlay" class="connection-overlay"><div class="spinner"></div><strong>Collegamento in corso…</strong><small>Preparazione del flusso protetto</small></div>
+          <div id="alertOverlay" class="alert-overlay hidden" role="status"></div>
+          <div class="video-bottom-row"><span id="streamHealth" class="video-badge">Video in attesa</span><span id="sessionTimer" class="video-badge">00:00</span></div>
+        </div>
+
+        <div class="status-strip">
+          <div><span id="audioStateIcon">🔊</span><strong id="audioStateText">Audio in attesa</strong><small id="adaptiveVolumeLabel">Volume adattivo</small></div>
+          <div><span id="parentCountIcon">👥</span><strong id="parentCountText">1 di 3 Parent</strong><small id="slotCountText">2 slot disponibili</small></div>
+        </div>
+
+        <div class="primary-actions parent-actions">
+          <button id="listenToggle" class="control-button active"><span>🔊</span><small>Ascolto</small></button>
+          <button id="nightModeButton" class="control-button"><span>☾</span><small>Notte: Auto</small></button>
+          <button id="fullscreenButton" class="control-button"><span>⛶</span><small>Schermo intero</small></button>
+          <button id="pauseParentButton" class="control-button"><span>Ⅱ</span><small>Interrompi</small></button>
+        </div>
+
+        <button id="audioUnlockButton" class="primary-button full hidden">Attiva audio</button>
+        <div id="reconnectCard" class="reconnect-card hidden">
+          <div><strong>Monitor interrotto</strong><small id="reconnectCountdown">Riconnessione disponibile per 30 s</small></div>
+          <button id="reconnectButton" class="small-button">Riconnetti</button>
+        </div>
+        <div class="event-card">
+          <div class="card-heading"><div><p class="eyebrow">EVENTI DELLA SESSIONE</p><h2>Ultimi avvisi</h2></div><button id="clearEventsButton" class="text-button">Pulisci</button></div>
+          <div id="eventTimeline" class="timeline"><p class="empty-state">Nessun evento rilevato.</p></div>
+        </div>
+      </section>
+    </main>
+
+    <div id="modalBackdrop" class="modal-backdrop hidden" aria-hidden="true"></div>
+
+    <dialog id="inviteDialog" class="sheet-dialog">
+      <div class="sheet-handle"></div>
+      <div class="sheet-heading"><div><p class="eyebrow">DISPOSITIVI</p><h2>Aggiungi un Parent</h2></div><button class="icon-button" data-close-dialog="inviteDialog" aria-label="Chiudi">×</button></div>
+      <p id="inviteCapacity" class="capacity-message">0 di 3 Parent collegati</p>
+      <div id="inviteLoading" class="loading-card hidden"><div class="spinner"></div><span>Creo un invito sicuro…</span></div>
+      <div id="inviteContent">
+        <div class="qr-shell"><img id="inviteQr" alt="QR per collegare un nuovo Parent" width="220" height="220"></div>
+        <div class="pin-display"><span>PIN temporaneo</span><strong id="invitePin">—— ——</strong><small id="inviteExpiry">Scade tra 5:00</small></div>
+        <p class="sheet-note">Questo invito è temporaneo, monouso e non contiene il token privato di questo dispositivo.</p>
+        <div class="sheet-actions"><button id="shareInviteButton" class="primary-button">Condividi invito</button><button id="revokeInviteButton" class="secondary-button">Revoca</button></div>
+      </div>
+      <p id="inviteError" class="inline-error hidden" role="alert"></p>
+    </dialog>
+
+    <dialog id="scannerDialog" class="scanner-dialog">
+      <div class="scanner-header"><div><p class="eyebrow">SCANSIONE QR</p><h2>Inquadra il codice</h2></div><button class="icon-button" data-close-dialog="scannerDialog" aria-label="Chiudi">×</button></div>
+      <div class="scanner-stage"><video id="scannerVideo" autoplay muted playsinline></video><canvas id="scannerCanvas" hidden></canvas><div class="scanner-reticle"><i></i><i></i><i></i><i></i></div></div>
+      <p id="scannerHint">Allinea il QR dentro il riquadro.</p>
+      <label class="secondary-button upload-qr">Scegli una foto del QR<input id="qrImageInput" type="file" accept="image/*" capture="environment"></label>
+      <p id="scannerError" class="inline-error hidden" role="alert"></p>
+    </dialog>
+
+    <dialog id="settingsDialog" class="sheet-dialog settings-sheet">
+      <div class="sheet-handle"></div>
+      <div class="sheet-heading"><div><p class="eyebrow">PARENT</p><h2>Impostazioni</h2></div><button class="icon-button" data-close-dialog="settingsDialog" aria-label="Chiudi">×</button></div>
+      <div class="settings-group">
+        <h3>Audio e video</h3>
+        <label class="setting-row"><span><strong>Ascolta Baby</strong><small>Spegni per evitare rimbombo quando i telefoni sono vicini.</small></span><input id="listenSwitch" type="checkbox" role="switch" checked></label>
+        <label class="setting-row"><span><strong>Volume adattivo</strong><small>Riduce gradualmente il volume durante audio continuo.</small></span><input id="adaptiveSwitch" type="checkbox" role="switch" checked></label>
+        <label class="setting-row"><span><strong>Microfono Baby</strong><small>Se spento, anche il rilevamento pianto viene sospeso.</small></span><input id="babyMicSwitch" type="checkbox" role="switch" checked></label>
+        <div class="setting-row"><span><strong>Visione notturna</strong><small>Ottimizzazione software; non sostituisce una camera a infrarossi.</small></span><select id="nightModeSelect"><option value="auto">Auto</option><option value="on">Attiva</option><option value="off">Disattiva</option></select></div>
+      </div>
+      <div class="settings-group">
+        <h3>Rilevatori locali</h3>
+        <label class="setting-row"><span><strong>Possibile pianto</strong><small>Analisi sul telefono Baby.</small></span><input id="crySwitch" type="checkbox" role="switch" checked></label>
+        <label class="setting-row"><span><strong>Movimento</strong><small>Confronto locale dei fotogrammi.</small></span><input id="motionSwitch" type="checkbox" role="switch" checked></label>
+        <div class="setting-row"><span><strong>Sensibilità</strong><small>Regola la soglia degli avvisi.</small></span><select id="sensitivitySelect"><option value="low">Bassa</option><option value="medium" selected>Media</option><option value="high">Alta</option></select></div>
+      </div>
+      <div class="settings-group devices-group">
+        <div class="group-title"><div><h3>Dispositivi</h3><p id="settingsParentCount">1 di 3 Parent collegati</p></div><button id="parentInviteButton" class="small-button">＋ Aggiungi Parent</button></div>
+        <p id="parentInviteHelp" class="helper-text">Crea un QR e PIN temporanei senza condividere il token privato di questo Parent.</p>
+      </div>
+      <div class="settings-group">
+        <h3>Diagnostica</h3>
+        <div id="diagnosticsGrid" class="diagnostics-grid"><span>Versione</span><strong>1.2.0</strong><span>WebRTC</span><strong>—</strong><span>Media</span><strong>—</strong><span>Inviti attivi</span><strong>—</strong></div>
+        <button id="refreshDiagnosticsButton" class="secondary-button full">Aggiorna diagnostica</button>
+      </div>
+    </dialog>
+
+    <div id="installBanner" class="install-banner hidden" role="region" aria-label="Installa BabyMoon">
+      <div class="install-icon">☾</div><div><strong>Installa BabyMoon</strong><small id="installHint">Aprila più velocemente dalla schermata Home.</small></div><button id="installButton" class="small-button">Installa</button><button id="dismissInstallButton" class="icon-button" aria-label="Chiudi">×</button>
+    </div>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   </div>
-  <div id="toast" class="toast hidden" role="status" aria-live="assertive"></div>
+
   <script src="/socket.io/socket.io.js"></script>
-  <script src="/detectors.js?v=1.1.2"></script>
-  <script src="/app.js?v=1.1.2"></script>
+  <script src="/vendor/jsQR.js"></script>
+  <script src="/app.js" defer></script>
 </body>
 </html>

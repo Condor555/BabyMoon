@@ -1,1296 +1,1064 @@
-(() => {
-  'use strict';
+'use strict';
 
-  const VERSION = '1.1.2';
-  const STORAGE_KEY = 'babymoon-session-v1.1.2';
-  const app = document.querySelector('#app');
-  const badge = document.querySelector('#connectionBadge');
-  const remoteAudio = document.querySelector('#remoteAudio');
-  const darkOverlay = document.querySelector('#darkOverlay');
-  const toastElement = document.querySelector('#toast');
-  const socket = window.io({ transports: ['websocket', 'polling'], reconnection: true, reconnectionAttempts: Infinity });
+const $ = (id) => document.getElementById(id);
+const socket = io({ autoConnect: true, transports: ['websocket', 'polling'] });
+const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
+const MAX_PARENTS = 3;
 
-  const state = {
-    role: 'home',
-    view: 'home',
-    sessionId: '',
-    parentId: '',
-    token: '',
-    pin: '',
-    qrDataUrl: '',
-    localStream: null,
-    remoteStream: null,
-    peer: null,
-    babyPeers: new Map(),
-    negotiationId: '',
-    queuedCandidates: [],
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    facingMode: 'environment',
-    connected: false,
-    mediaReceived: false,
-    parentListening: false,
-    babyMicEnabled: true,
-    parentCount: 0,
-    authorizedParentCount: 0,
-    maxParents: 3,
-    adaptiveEnabled: true,
-    adaptiveLevel: 0.55,
-    adaptiveContext: null,
-    adaptiveAnalyser: null,
-    adaptiveTimer: null,
-    settings: { cryEnabled: true, motionEnabled: true, sensitivity: 'medium', cooldownSeconds: 30 },
-    alerts: [],
-    lastAlert: { cry: 0, motion: 0 },
-    cryDetector: null,
-    motionDetector: null,
-    analysisVideo: null,
-    wakeLock: null,
-    peerRetry: 0,
-    peerRetryTimer: null,
-    connectionTimer: null,
-    statsTimer: null,
-    diagnostics: { ice: 'new', rtc: 'new', audioBytes: 0, videoBytes: 0, path: 'In attesa' },
-    pendingQr: null,
-    resuming: false,
-    negotiating: false,
-    reconnecting: false,
-    reconnectMode: '',
-    reconnectDeadline: 0,
-    reconnectAttempt: 0,
-    reconnectTimer: null,
-    reconnectTick: null,
-    reconnectInFlight: false,
-    reconnectRegistered: false,
-    finalTermination: false
-  };
+const state = {
+  role: null,
+  sessionId: null,
+  babyToken: null,
+  parentId: null,
+  parentToken: null,
+  localStream: null,
+  remoteStream: null,
+  babyPeers: new Map(),
+  parentPc: null,
+  currentInvite: null,
+  inviteTimer: null,
+  scannerStream: null,
+  scannerFrame: null,
+  detector: null,
+  wakeLock: null,
+  facingMode: 'environment',
+  parents: { connected: 0, max: MAX_PARENTS, available: MAX_PARENTS },
+  detection: { cry: true, motion: true, sensitivity: 'medium', cooldown: 20 },
+  environment: { luminance: null, lowLight: false },
+  analysis: { running: false, audioContext: null, timers: [], lastCry: 0, lastMotion: 0, previousFrame: null, cryFrames: 0 },
+  nightMode: localStorage.getItem('babymoon-night-mode') || 'auto',
+  listening: localStorage.getItem('babymoon-listening') !== 'false',
+  adaptiveVolume: localStorage.getItem('babymoon-adaptive') !== 'false',
+  adaptiveTimer: null,
+  adaptiveAudioContext: null,
+  sessionStartedAt: null,
+  sessionTimer: null,
+  reconnectTimer: null,
+  reconnectUntil: null,
+  manualPause: false,
+  eventLog: [],
+  deferredInstallPrompt: null,
+  installDismissed: Number(localStorage.getItem('babymoon-install-dismissed') || 0),
+  toastTimer: null,
+  joining: false
+};
 
-  function setBadge(text, type = 'neutral') {
-    badge.textContent = text;
-    badge.className = `badge ${type}`;
+const screens = ['homeScreen', 'permissionsScreen', 'babyScreen', 'joinScreen', 'parentScreen'];
+const errorMessages = {
+  INVALID_INVITE: 'Invito non valido. Controlla il PIN o scansiona di nuovo il QR.',
+  REVOKED_INVITE: 'Questo invito è stato revocato. Richiedine uno nuovo.',
+  CONSUMED_INVITE: 'Questo invito è già stato usato. Ogni invito collega un solo Parent.',
+  EXPIRED_INVITE: 'Invito scaduto. Generane uno nuovo dal Baby o da un Parent collegato.',
+  SESSION_ENDED: 'La sessione BabyMoon non è più attiva.',
+  PARENT_LIMIT: 'Sono già collegati 3 Parent. Libera uno slot prima di aggiungerne un altro.',
+  RATE_LIMIT: 'Troppi tentativi ravvicinati. Attendi un minuto e riprova.',
+  RECONNECT_EXPIRED: 'La finestra di riconnessione è scaduta. Usa un nuovo QR o PIN.',
+  UNAUTHORIZED: 'Autorizzazione non valida. Ricollega questo dispositivo.'
+};
+
+function showScreen(id) {
+  for (const screen of screens) $(screen).classList.toggle('active', screen === id);
+  $('backButton').classList.toggle('hidden', id === 'homeScreen' || id === 'babyScreen' || id === 'parentScreen');
+  window.scrollTo({ top: 0, behavior: 'instant' });
+  refreshInstallBanner();
+}
+
+function setHeaderStatus(label, tone = 'neutral') {
+  $('headerStatus').className = `status-chip ${tone}`;
+  $('headerStatus').lastElementChild.textContent = label;
+}
+
+function showToast(message, duration = 3200) {
+  clearTimeout(state.toastTimer);
+  $('toast').textContent = message;
+  $('toast').classList.remove('hidden');
+  state.toastTimer = setTimeout(() => $('toast').classList.add('hidden'), duration);
+}
+
+function showInlineError(id, error) {
+  const element = $(id);
+  element.textContent = errorMessages[error?.code || error?.message] || error?.message || String(error);
+  element.classList.remove('hidden');
+}
+
+function clearInlineError(id) {
+  $(id).classList.add('hidden');
+}
+
+function emitAck(event, payload = {}, timeout = 10_000) {
+  return new Promise((resolve, reject) => {
+    socket.timeout(timeout).emit(event, payload, (error, response) => {
+      if (error) return reject(new Error('Il server non ha risposto. Controlla la connessione.'));
+      if (!response?.ok) return reject(Object.assign(new Error(errorMessages[response?.code] || response?.code || 'Operazione non riuscita.'), { code: response?.code }));
+      resolve(response);
+    });
+  });
+}
+
+function formatPin(pin = '') {
+  return `${pin.slice(0, 3)} ${pin.slice(3)}`.trim();
+}
+
+function isStandalone() {
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function isIOS() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function refreshInstallBanner() {
+  const eligibleScreen = $('homeScreen').classList.contains('active');
+  const dismissedRecently = Date.now() - state.installDismissed < 7 * 24 * 60 * 60 * 1000;
+  const shouldShowAndroid = Boolean(state.deferredInstallPrompt && !isStandalone() && eligibleScreen && !dismissedRecently);
+  const shouldShowIOS = Boolean(isIOS() && !isStandalone() && eligibleScreen && !dismissedRecently);
+  const show = shouldShowAndroid || shouldShowIOS;
+  $('installBanner').classList.toggle('hidden', !show);
+  if (shouldShowIOS && !shouldShowAndroid) {
+    $('installHint').textContent = 'In Safari: Condividi → Aggiungi alla schermata Home.';
+    $('installButton').textContent = 'Come fare';
+  } else {
+    $('installHint').textContent = 'Aprila più velocemente dalla schermata Home.';
+    $('installButton').textContent = 'Installa';
   }
+}
 
-  let toastTimer;
-  function toast(message, duration = 3500) {
-    clearTimeout(toastTimer);
-    toastElement.textContent = message;
-    toastElement.classList.remove('hidden');
-    toastTimer = setTimeout(() => toastElement.classList.add('hidden'), duration);
+async function installPwa() {
+  if (state.deferredInstallPrompt) {
+    state.deferredInstallPrompt.prompt();
+    const choice = await state.deferredInstallPrompt.userChoice;
+    state.deferredInstallPrompt = null;
+    if (choice.outcome === 'accepted') showToast('BabyMoon è stata aggiunta al dispositivo.');
+    refreshInstallBanner();
+    return;
   }
+  if (isIOS()) showToast('In Safari tocca Condividi, poi “Aggiungi alla schermata Home”.', 7000);
+}
 
-  function saveCredentials() {
-    if (!state.sessionId || !state.token || !['baby', 'parent'].includes(state.role)) return;
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ role: state.role, sessionId: state.sessionId, parentId: state.parentId, token: state.token }));
+async function registerServiceWorker() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  try {
+    const registration = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    registration.update().catch(() => {});
+    registration.addEventListener('updatefound', () => {
+      const worker = registration.installing;
+      worker?.addEventListener('statechange', () => {
+        if (worker.state === 'installed' && navigator.serviceWorker.controller) showToast('Aggiornamento pronto. Verrà applicato alla prossima apertura.');
+      });
+    });
+  } catch (error) {
+    console.warn('Service worker non registrato', error);
   }
+}
 
-  function clearCredentials() {
-    sessionStorage.removeItem(STORAGE_KEY);
-    state.sessionId = '';
-    state.parentId = '';
-    state.token = '';
-    state.pin = '';
+async function requestWakeLock() {
+  if (state.role !== 'baby' || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try {
+    state.wakeLock = await navigator.wakeLock.request('screen');
+    state.wakeLock.addEventListener('release', () => { state.wakeLock = null; });
+  } catch (error) {
+    console.info('Wake Lock non disponibile', error.message);
   }
+}
 
-  function loadCredentials() {
-    try {
-      const saved = JSON.parse(sessionStorage.getItem(STORAGE_KEY) || 'null');
-      if (saved && ['baby', 'parent'].includes(saved.role) && saved.sessionId && saved.token) {
-        state.role = saved.role;
-        state.sessionId = saved.sessionId;
-        state.parentId = saved.parentId || '';
-        state.token = saved.token;
-        return true;
-      }
-    } catch (_error) {
-      clearCredentials();
-    }
-    return false;
-  }
+async function requestBabyMedia() {
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error('Camera e microfono richiedono HTTPS e un browser compatibile.');
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: state.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } },
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: { ideal: 1 } }
+  });
+  state.localStream?.getTracks().forEach((track) => track.stop());
+  state.localStream = stream;
+  $('localVideo').srcObject = stream;
+  $('cameraPermission').textContent = 'Consentita';
+  $('cameraPermission').classList.add('ready');
+  $('micPermission').textContent = stream.getAudioTracks().length ? 'Consentito' : 'Non disponibile';
+  $('micPermission').classList.toggle('ready', stream.getAudioTracks().length > 0);
+  return stream;
+}
 
-  function authPayload(extra = {}) {
-    return { sessionId: state.sessionId, parentId: state.parentId, token: state.token, role: state.role, ...extra };
-  }
-
-  function renderHome() {
-    state.view = 'home';
-    state.role = 'home';
-    state.finalTermination = false;
-    setBadge('Pronto', 'neutral');
-    app.innerHTML = `
-      <section class="hero">
-        <div class="moon" aria-hidden="true">🌙</div>
-        <h1>BabyMoon</h1>
-        <p class="claim">Sempre vicino, anche durante il sonno.</p>
-      </section>
-      <section class="grid two" aria-label="Scegli modalità">
-        <button class="card role-card" data-action="choose-baby">
-          <span class="icon">👶</span><strong>Questo è il Baby</strong>
-          <small>Condivide fotocamera e microfono in modo P2P.</small>
-        </button>
-        <button class="card role-card" data-action="choose-parent">
-          <span class="icon">📱</span><strong>Questo è il Parent</strong>
-          <small>Riceve video e audio senza usare il proprio microfono.</small>
-        </button>
-      </section>
-      <div class="notice">🔒 Audio e video viaggiano cifrati tramite WebRTC. Il rilevamento avviene sul telefono Baby: non vengono salvate registrazioni.</div>
-      <div class="version">BabyMoon v${VERSION}</div>`;
-  }
-
-  function renderBabyPermission(resume = false) {
+async function startBaby() {
+  clearInlineError('permissionError');
+  $('grantMediaButton').disabled = true;
+  $('grantMediaButton').textContent = 'Preparazione…';
+  try {
+    await requestBabyMedia();
+    const response = await emitAck('create-session');
     state.role = 'baby';
-    state.view = 'baby-permission';
-    setBadge('Configurazione Baby', 'neutral');
-    app.innerHTML = `
-      <section class="card">
-        <h2>👶 Telefono Baby</h2>
-        <p>BabyMoon userà fotocamera e microfono. L'audio richiede cancellazione eco, riduzione rumore, guadagno automatico e canale mono quando supportati dal browser.</p>
-        <div class="notice warning">Tieni il telefono alimentato e stabile. BabyMoon non sostituisce la supervisione di un adulto o un dispositivo medico/certificato.</div>
-        <div class="actions">
-          <button class="btn primary" data-action="${resume ? 'resume-baby' : 'start-baby'}">🎥 ${resume ? 'Riprendi fotocamera e microfono' : 'Consenti e continua'}</button>
-          <button class="btn secondary" data-action="home">Indietro</button>
-        </div>
-      </section>`;
+    state.sessionId = response.sessionId;
+    state.babyToken = response.babyToken;
+    state.parents = response.status;
+    state.detection = response.detection;
+    updateParentCapacity(response.status);
+    setInvite(response.invite);
+    showScreen('babyScreen');
+    setHeaderStatus('Monitor attivo', 'warning');
+    startLocalAnalysis();
+    requestWakeLock();
+  } catch (error) {
+    showInlineError('permissionError', error);
+  } finally {
+    $('grantMediaButton').disabled = false;
+    $('grantMediaButton').textContent = 'Consenti e continua';
   }
+}
 
-  function renderBabyPairing() {
-    state.view = 'baby-pairing';
-    setBadge('In attesa del Parent', 'warn');
-    app.innerHTML = `
-      <section class="card pairing">
-        <div>
-          <h2>Associa il Parent</h2>
-          <p>Scansiona il QR sui telefoni Parent oppure inserisci il PIN. Il codice resta valido 5 minuti e autorizza fino a ${state.maxParents} Parent.</p>
-          <div class="pin-display" aria-label="PIN ${state.pin}">${state.pin}</div>
-          <div class="spinner" aria-hidden="true"></div>
-          <p style="text-align:center">In attesa del Parent…</p>
-        </div>
-        <img class="qr" src="${state.qrDataUrl}" alt="QR per collegare il Parent">
-      </section>
-      <div class="actions"><button class="btn danger" data-action="end">⏹ Termina sessione</button></div>`;
-  }
+function authPayload() {
+  if (state.role === 'baby') return { sessionId: state.sessionId, token: state.babyToken };
+  return { sessionId: state.sessionId, parentId: state.parentId, token: state.parentToken };
+}
 
-  function renderParentPairing(error = '') {
-    state.role = 'parent';
-    state.view = 'parent-pairing';
-    setBadge('Associa il Parent', 'neutral');
-    app.innerHTML = `
-      <section class="card">
-        <h2>📱 Telefono Parent</h2>
-        <p>Inserisci il PIN mostrato sul telefono Baby. Il Parent non richiede accesso a fotocamera o microfono.</p>
-        <form class="form" id="pinForm">
-          <label>PIN a 6 cifre
-            <input id="pinInput" class="pin-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="000000" aria-describedby="pairError">
-          </label>
-          <div id="pairError" class="notice ${error ? 'warning' : 'hidden'}">${error}</div>
-          <button class="btn primary" type="submit">Collega</button>
-        </form>
-        <div class="notice">🔊 Dopo la connessione toccherai “Attiva audio”: è necessario su iPhone/Safari e previene riproduzioni involontarie.</div>
-      </section>`;
-    requestAnimationFrame(() => document.querySelector('#pinInput')?.focus());
-  }
-
-  function renderConnecting(label = 'Connessione in corso…') {
-    state.view = 'connecting';
-    setBadge(label, 'warn');
-    app.innerHTML = `<section class="card" style="text-align:center"><div class="spinner"></div><h2>${label}</h2><p>Negoziazione WebRTC diretta tramite STUN/P2P.</p></section>`;
-  }
-
-  function renderBabyMonitor() {
-    state.view = 'baby-monitor';
-    const babyLive = state.parentCount > 0;
-    setBadge(babyLive ? 'LIVE' : 'In attesa di Parent…', babyLive ? 'ok' : 'warn');
-    app.innerHTML = `
-      <section class="monitor-layout">
-        <div>
-          <div class="video-shell live">
-            <video id="localVideo" autoplay muted playsinline></video>
-            <div class="overlay-status"><span>${babyLive ? '🟢 LIVE' : '🟡 In attesa'}</span><span>Baby</span></div>
-          </div>
-          <div class="control-grid">
-            <button class="btn secondary" data-action="switch-camera">🔄 <span>Cambia camera</span></button>
-            <button class="btn secondary" data-action="dark">🌙 <span>Oscura</span></button>
-            <button class="btn danger" data-action="end">⏹ <span>Termina</span></button>
-          </div>
-        </div>
-        <div class="grid">
-          <section class="card">
-            <h3>Stato Baby</h3>
-            <div class="status-list">
-              <div class="status-row"><span>Parent collegati</span><strong>${state.parentCount} ${state.parentCount === 1 ? 'Parent collegato' : 'Parent collegati'} · max ${state.maxParents}</strong></div>
-              <div class="status-row"><span>Microfono</span><strong>${state.babyMicEnabled ? '🎙️ Attivo' : '🔇 Disattivato dal Parent'}</strong></div>
-              <div class="status-row"><span>Possibile pianto</span><strong>${state.babyMicEnabled && state.settings.cryEnabled ? 'Attivo' : 'Sospeso'}</strong></div>
-              <div class="status-row"><span>Movimento</span><strong>${state.settings.motionEnabled ? 'Attivo' : 'Disattivato'}</strong></div>
-              <div class="status-row"><span>Sensibilità</span><strong>${sensitivityLabel(state.settings.sensitivity)}</strong></div>
-            </div>
-          </section>
-          <section class="card"><h3>Privacy</h3><p>L'analisi audio/video è locale. Al Parent vengono inviati solo gli eventi e lo stream WebRTC; non vengono create clip o registrazioni.</p></section>
-        </div>
-      </section>`;
-    attachLocalVideo();
-  }
-
-  function renderParentMonitor() {
-    state.role = 'parent';
-    state.view = 'parent-monitor';
-    setBadge(state.connected ? 'LIVE' : 'Riconnessione…', state.connected ? 'ok' : 'warn');
-    const hasVideo = Boolean(state.remoteStream?.getVideoTracks().length);
-    const listenTitle = state.parentListening ? '🔊 Ascolto attivo' : '🔇 Attiva audio';
-    const micTitle = state.babyMicEnabled ? '🎙️ Mic Baby attivo' : '🔇 Mic Baby spento';
-    app.innerHTML = `
-      <section class="monitor-layout">
-        <div>
-          <div id="remoteShell" class="video-shell ${hasVideo ? 'live' : ''}">
-            <video id="remoteVideo" autoplay muted playsinline></video>
-            <div class="placeholder"><span style="font-size:2.5rem">🌙</span><strong>In attesa del video Baby</strong><small>La riconnessione è automatica.</small></div>
-            <div class="overlay-status"><span>${state.connected ? '🟢 LIVE' : '🟡 Connessione'}</span><span id="adaptiveBadge">${state.adaptiveEnabled ? `Volume adattivo ${Math.round(state.adaptiveLevel * 100)}%` : 'Volume normale'}</span></div>
-          </div>
-          <div class="control-grid">
-            <button class="btn ${state.parentListening ? 'success' : 'primary'}" data-action="toggle-listening">${listenTitle}<small>${state.parentListening ? 'Tocca per silenziare' : 'Richiede un tocco'}</small></button>
-            <button class="btn ${state.adaptiveEnabled ? 'success' : 'secondary'}" data-action="toggle-adaptive">🔉 Volume adattivo<small>${state.adaptiveEnabled ? 'Attivo' : 'Disattivato'}</small></button>
-            <button class="btn ${state.babyMicEnabled ? 'success' : 'secondary'}" data-action="toggle-baby-mic">${micTitle}<small>${state.babyMicEnabled ? 'Tocca per spegnere' : 'Tocca per riattivare'}</small></button>
-            <button class="btn secondary" data-action="fullscreen">⛶ Schermo intero<small>Dove supportato</small></button>
-             <button class="btn secondary" data-action="retry">↻ Riprova ora<small>Forza nuova negoziazione</small></button>
-             <button class="btn secondary" data-action="interrupt-parent">⏸ Interrompi<small>Riaggancio per 30 secondi</small></button>
-             <button class="btn danger" data-action="end">⏹ Termina sessione<small>Chiude entrambi</small></button>
-          </div>
-        </div>
-        <div class="grid">
-          <section class="card settings">
-            <h3>Rilevamento locale</h3>
-            <div class="switch-row"><span>👶 Possibile pianto</span><button class="btn ${state.settings.cryEnabled ? 'success' : 'secondary'}" data-action="toggle-cry">${state.settings.cryEnabled ? 'Attivo' : 'Spento'}</button></div>
-            <div class="switch-row"><span>〰️ Movimento</span><button class="btn ${state.settings.motionEnabled ? 'success' : 'secondary'}" data-action="toggle-motion">${state.settings.motionEnabled ? 'Attivo' : 'Spento'}</button></div>
-            <label>Sensibilità
-              <select id="sensitivitySelect" data-setting="sensitivity">
-                <option value="low" ${state.settings.sensitivity === 'low' ? 'selected' : ''}>Bassa</option>
-                <option value="medium" ${state.settings.sensitivity === 'medium' ? 'selected' : ''}>Media</option>
-                <option value="high" ${state.settings.sensitivity === 'high' ? 'selected' : ''}>Alta</option>
-              </select>
-            </label>
-            <label>Cooldown avvisi
-              <select id="cooldownSelect" data-setting="cooldownSeconds">
-                ${[10, 30, 60, 120, 300].map((v) => `<option value="${v}" ${state.settings.cooldownSeconds === v ? 'selected' : ''}>${v < 60 ? `${v} secondi` : `${v / 60} min`}</option>`).join('')}
-              </select>
-            </label>
-            ${!state.babyMicEnabled ? '<div class="notice warning">Il rilevamento del possibile pianto è sospeso perché il microfono Baby è spento.</div>' : ''}
-          </section>
-          <section class="card">
-            <h3>Eventi recenti</h3>
-            <ul class="timeline">${state.alerts.length ? state.alerts.map((item) => `<li><span>${item.type === 'cry' ? '👶 Possibile pianto' : '〰️ Movimento'}</span><time>${new Date(item.at).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time></li>`).join('') : '<li class="empty">Nessun evento in questa sessione</li>'}</ul>
-          </section>
-          <section class="card">
-            <h3>Diagnostica</h3>
-            <div class="status-list">
-              <div class="status-row"><span>Questo Parent</span><strong>${state.parentId ? state.parentId.slice(0, 8) : '—'}</strong></div>
-              <div class="status-row"><span>Parent sessione</span><strong>${state.parentCount}/${state.maxParents} collegati</strong></div>
-              <div class="status-row"><span>WebRTC</span><strong id="diagRtc">${state.diagnostics.rtc}</strong></div>
-              <div class="status-row"><span>ICE</span><strong id="diagIce">${state.diagnostics.ice}</strong></div>
-              <div class="status-row"><span>Percorso</span><strong id="diagPath">${state.diagnostics.path}</strong></div>
-              <div class="status-row"><span>Media ricevuti</span><strong id="diagMedia">audio ${state.diagnostics.audioBytes} · video ${state.diagnostics.videoBytes}</strong></div>
-            </div>
-          </section>
-        </div>
-      </section>`;
-    attachRemoteMedia();
-  }
-
-  function renderReconnectWindow() {
-    state.view = 'parent-reconnect';
-    const remaining = Math.max(0, Math.ceil((state.reconnectDeadline - Date.now()) / 1000));
-    const automatic = state.reconnectMode === 'automatic';
-    setBadge(`Riconnessione · ${remaining}s`, 'warn');
-    app.innerHTML = `
-      <section class="card" style="text-align:center">
-        <div style="font-size:3rem">↻</div>
-        <h2>Monitoraggio interrotto</h2>
-        <p>Il Baby resta attivo. Puoi riagganciare questa sessione entro <strong id="reconnectSeconds">${remaining}</strong> secondi.</p>
-        <div class="notice ${automatic ? '' : 'warning'}" id="reconnectStatus">${automatic ? 'Riconnessione automatica in corso, senza connessioni sovrapposte…' : 'Interruzione volontaria: premi Riconnetti quando vuoi riprendere il monitoraggio.'}</div>
-        <div class="actions">
-          <button class="btn primary" data-action="reconnect-parent">↻ Riconnetti</button>
-          <button class="btn danger" data-action="end">⏹ Termina sessione</button>
-        </div>
-      </section>`;
-  }
-
-  function renderEnded(reason = 'Sessione terminata') {
-    state.view = 'ended';
-    setBadge('Terminata', 'danger');
-    app.innerHTML = `
-      <section class="card" style="text-align:center"><div style="font-size:3rem">🌙</div><h2>${reason}</h2><p>Fotocamera, microfono e collegamento sono stati chiusi.</p><div class="actions"><button class="btn primary" data-action="finish-home">Torna alla Home</button></div></section>`;
-  }
-
-  function sensitivityLabel(value) {
-    return ({ low: 'Bassa', medium: 'Media', high: 'Alta' })[value] || 'Media';
-  }
-
-  function mediaConstraints() {
-    return {
-      video: { facingMode: { ideal: state.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } },
-      audio: {
-        echoCancellation: { ideal: true },
-        noiseSuppression: { ideal: true },
-        autoGainControl: { ideal: true },
-        channelCount: { ideal: 1 },
-        sampleRate: { ideal: 48000 }
-      }
-    };
-  }
-
-  async function acquireBabyMedia() {
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Fotocamera e microfono non supportati.');
-    try {
-      return await navigator.mediaDevices.getUserMedia(mediaConstraints());
-    } catch (firstError) {
-      if (firstError?.name === 'NotAllowedError') throw firstError;
-      toast('Il dispositivo non accetta tutti i filtri audio: uso impostazioni compatibili.', 5000);
-      return navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: state.facingMode } }, audio: true });
+function setInvite(invite) {
+  state.currentInvite = invite;
+  $('inviteQr').src = invite.qrUrl;
+  $('invitePin').textContent = formatPin(invite.pin);
+  clearInterval(state.inviteTimer);
+  const updateExpiry = () => {
+    const seconds = Math.max(0, Math.ceil((invite.expiresAt - Date.now()) / 1000));
+    $('inviteExpiry').textContent = seconds ? `Scade tra ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : 'Invito scaduto';
+    if (!seconds) {
+      $('shareInviteButton').disabled = true;
+      clearInterval(state.inviteTimer);
     }
-  }
+  };
+  updateExpiry();
+  state.inviteTimer = setInterval(updateExpiry, 1000);
+}
 
-  async function startBaby(resume = false) {
-    setBadge('Richiesta permessi…', 'warn');
-    try {
-      state.localStream = await acquireBabyMedia();
-      const audioTrack = state.localStream.getAudioTracks()[0];
-      if (!audioTrack) throw new Error('Nessuna traccia microfono disponibile.');
-      state.babyMicEnabled = audioTrack.enabled;
-      await prepareBabyAnalysis();
-      await requestWakeLock();
-      if (resume && state.sessionId && state.token) {
-        resumeSession();
-      } else {
-        socket.emit('create-session', {}, (response) => {
-          if (!response?.ok) {
-            toast(response?.error || 'Impossibile creare la sessione.');
-            stopLocalMedia();
-            renderBabyPermission();
-            return;
-          }
-          state.sessionId = response.sessionId;
-          state.token = response.babyToken;
-          state.pin = response.pin;
-          state.qrDataUrl = response.qrDataUrl;
-          state.settings = response.settings || state.settings;
-          state.maxParents = response.maxParents || state.maxParents;
-          state.finalTermination = false;
-          saveCredentials();
-          applyDetectorSettings();
-          renderBabyPairing();
-        });
-      }
-    } catch (error) {
-      const denied = error?.name === 'NotAllowedError';
-      toast(denied ? 'Permessi negati. Abilita fotocamera e microfono nelle impostazioni del browser.' : (error?.message || 'Impossibile avviare fotocamera e microfono.'), 6000);
-      renderBabyPermission(resume);
+async function openInviteDialog(useExisting = false) {
+  clearInlineError('inviteError');
+  $('inviteCapacity').textContent = `${state.parents.connected} di ${state.parents.max} Parent collegati · ${state.parents.available} slot disponibili`;
+  if (state.parents.available <= 0) {
+    $('inviteContent').classList.add('hidden');
+    showInlineError('inviteError', { code: 'PARENT_LIMIT' });
+    $('inviteDialog').showModal();
+    return;
+  }
+  $('inviteContent').classList.toggle('hidden', !useExisting || !state.currentInvite);
+  $('inviteLoading').classList.toggle('hidden', Boolean(useExisting && state.currentInvite));
+  $('inviteDialog').showModal();
+  if (useExisting && state.currentInvite && state.currentInvite.expiresAt > Date.now()) return;
+  try {
+    const response = await emitAck('create-pairing', authPayload());
+    state.parents = response.status;
+    setInvite(response.invite);
+    $('inviteLoading').classList.add('hidden');
+    $('inviteContent').classList.remove('hidden');
+  } catch (error) {
+    $('inviteLoading').classList.add('hidden');
+    $('inviteContent').classList.add('hidden');
+    showInlineError('inviteError', error);
+  }
+}
+
+async function revokeCurrentInvite() {
+  if (!state.currentInvite) return;
+  try {
+    await emitAck('revoke-pairing', { ...authPayload(), inviteId: state.currentInvite.inviteId });
+    state.currentInvite = null;
+    $('inviteDialog').close();
+    showToast('Invito revocato.');
+  } catch (error) {
+    showInlineError('inviteError', error);
+  }
+}
+
+async function shareCurrentInvite() {
+  const invite = state.currentInvite;
+  if (!invite) return;
+  const shareData = { title: 'Collegati a BabyMoon', text: `Apri BabyMoon e usa il PIN ${formatPin(invite.pin)}. L’invito è temporaneo e monouso.`, url: invite.joinUrl };
+  try {
+    if (navigator.share) await navigator.share(shareData);
+    else {
+      await navigator.clipboard.writeText(`${shareData.text}\n${shareData.url}`);
+      showToast('Invito copiato negli appunti.');
     }
+  } catch (error) {
+    if (error.name !== 'AbortError') showToast('Non è stato possibile condividere l’invito.');
   }
+}
 
-  async function prepareBabyAnalysis() {
-    if (!state.localStream) return;
-    state.analysisVideo = document.createElement('video');
-    state.analysisVideo.muted = true;
-    state.analysisVideo.playsInline = true;
-    state.analysisVideo.srcObject = state.localStream;
-    await state.analysisVideo.play().catch(() => {});
-    state.cryDetector = new window.BabyMoonDetectors.CryDetector(state.localStream, (confidence) => emitAlert('cry', confidence));
-    state.motionDetector = new window.BabyMoonDetectors.MotionDetector(state.analysisVideo, (confidence) => emitAlert('motion', confidence));
-    await state.cryDetector.start();
-    state.motionDetector.start();
-    applyDetectorSettings();
+function updateParentCapacity(status = state.parents) {
+  state.parents = status;
+  const label = `${status.connected} di ${status.max} Parent`;
+  $('babyParentCount').textContent = label;
+  $('parentCountText').textContent = label;
+  $('settingsParentCount').textContent = `${label} collegati`;
+  $('slotCountText').textContent = status.available === 1 ? '1 slot disponibile' : `${status.available} slot disponibili`;
+  $('parentInviteButton').disabled = status.available <= 0;
+  $('babyInviteButton').disabled = status.available <= 0;
+  $('parentInviteHelp').textContent = status.available <= 0
+    ? 'Limite raggiunto. Un Parent deve uscire prima di aggiungerne un altro.'
+    : 'Crea un QR e PIN temporanei senza condividere il token privato di questo Parent.';
+  if (state.role === 'baby') {
+    $('babyLiveBadge').textContent = status.connected ? 'LIVE' : 'IN ATTESA';
+    $('babyLiveBadge').className = `live-badge ${status.connected ? 'live' : 'waiting'}`;
+    $('babyConnectionTitle').textContent = status.connected ? `${label} collegati` : 'In attesa del primo Parent';
+    $('babyConnectionHint').textContent = status.available ? `${status.available} slot ancora disponibili.` : 'Limite di 3 Parent raggiunto.';
+    setHeaderStatus(status.connected ? 'LIVE' : 'In attesa', status.connected ? 'live' : 'warning');
   }
+}
 
-  function applyDetectorSettings() {
-    state.cryDetector?.configure({ enabled: state.settings.cryEnabled && state.babyMicEnabled, sensitivity: state.settings.sensitivity });
-    state.motionDetector?.configure({ enabled: state.settings.motionEnabled, sensitivity: state.settings.sensitivity });
-  }
+function parseInvite(value) {
+  const match = String(value || '').match(/^([0-9a-f-]{36})\.([A-Za-z0-9_-]{20,})$/i);
+  return match ? value : null;
+}
 
-  function emitAlert(type, confidence) {
-    if (state.role !== 'baby' || !state.sessionId) return;
-    const now = Date.now();
-    const cooldownMs = state.settings.cooldownSeconds * 1000;
-    if (now - (state.lastAlert[type] || 0) < cooldownMs) return;
-    state.lastAlert[type] = now;
-    socket.emit('alert', authPayload({ type, confidence }));
-  }
-
-  function pairWithPin(pin) {
-    renderConnecting('Associazione in corso…');
-    socket.emit('pair-session', { pin }, handlePairResponse);
-  }
-
-  function pairWithQr(qr) {
-    state.role = 'parent';
-    renderConnecting('Associazione QR in corso…');
-    socket.emit('pair-session', { sessionId: qr.sessionId, qrToken: qr.token }, handlePairResponse);
-  }
-
-  function handlePairResponse(response) {
-    if (!response?.ok) {
-      state.pendingQr = null;
-      history.replaceState({}, '', '/');
-      renderParentPairing(response?.error || 'Associazione non riuscita.');
-      return;
-    }
+async function joinSession(credentials) {
+  if (state.joining) return;
+  state.joining = true;
+  clearInlineError('joinError');
+  try {
+    const response = await emitAck('join-session', credentials);
     state.role = 'parent';
     state.sessionId = response.sessionId;
     state.parentId = response.parentId;
-    state.token = response.parentToken;
-    state.settings = response.settings || state.settings;
-    state.babyMicEnabled = response.babyState?.micEnabled !== false;
-    state.maxParents = response.maxParents || state.maxParents;
-    state.finalTermination = false;
-    saveCredentials();
+    state.parentToken = response.parentToken;
+    state.reconnectUntil = response.reconnectUntil;
+    state.parents = response.status;
+    state.detection = response.detection;
+    state.environment = response.environment;
+    saveParentCredentials();
+    initializeParentUi();
+    showScreen('parentScreen');
+    setHeaderStatus('Connessione…', 'warning');
     history.replaceState({}, '', '/');
-    renderConnecting();
+  } catch (error) {
+    showInlineError('joinError', error);
+    showScreen('joinScreen');
+  } finally {
+    state.joining = false;
   }
+}
 
-  function resumeSession() {
-    if (state.resuming || !state.sessionId || !state.token) return;
-    if (state.role === 'baby' && !state.localStream) return;
-    state.resuming = true;
-    setBadge('Ripristino sessione…', 'warn');
-    socket.emit('resume-session', authPayload(), (response) => {
-      state.resuming = false;
-      if (!response?.ok) {
-        clearCredentials();
-        cleanup(false);
-        renderEnded('La sessione non è più disponibile');
-        return;
-      }
-      state.settings = response.settings || state.settings;
-      state.babyMicEnabled = response.babyState?.micEnabled !== false;
-      if (response.parentId) state.parentId = response.parentId;
-      saveCredentials();
-      applyDetectorSettings();
-      if (state.role === 'parent' && !state.reconnecting) renderParentMonitor();
-      else if (state.view !== 'baby-monitor') renderBabyPairing();
-    });
-  }
+function saveParentCredentials() {
+  localStorage.setItem('babymoon-parent-session', JSON.stringify({
+    sessionId: state.sessionId,
+    parentId: state.parentId,
+    parentToken: state.parentToken,
+    reconnectUntil: state.reconnectUntil
+  }));
+}
 
-  function createParentPeer(negotiationId) {
-    const earlyCandidates = state.negotiationId === negotiationId ? state.queuedCandidates.slice() : [];
-    closeParentPeer(false);
-    state.negotiationId = negotiationId || state.negotiationId;
-    const pc = new RTCPeerConnection({ iceServers: state.iceServers, iceCandidatePoolSize: 4 });
-    state.peer = pc;
-    state.queuedCandidates = earlyCandidates;
-    pc.onicecandidate = (event) => sendParentSignal({ candidate: event.candidate ? event.candidate.toJSON() : null });
-    pc.oniceconnectionstatechange = () => {
-      state.diagnostics.ice = pc.iceConnectionState;
-      updateDiagnostics();
-    };
-    pc.onconnectionstatechange = () => {
-      state.diagnostics.rtc = pc.connectionState;
-      updateDiagnostics();
-      if (pc.connectionState === 'connected') {
-        state.connected = true;
-        clearTimeout(state.connectionTimer);
-        if (state.reconnecting) completeParentReconnect();
-        else renderParentMonitor();
-        startStats();
-      } else if (['failed', 'disconnected'].includes(pc.connectionState) && !state.finalTermination) {
-        state.connected = false;
-        beginParentReconnect('automatic');
-      }
-    };
-    pc.ontrack = (event) => {
-      if (!state.remoteStream) state.remoteStream = new MediaStream();
-      const incoming = event.streams[0];
-      const tracks = incoming ? incoming.getTracks() : [event.track];
-      for (const track of tracks) {
-        for (const oldTrack of state.remoteStream.getTracks().filter((item) => item.kind === track.kind && item.readyState === 'ended')) {
-          state.remoteStream.removeTrack(oldTrack);
-        }
-        if (!state.remoteStream.getTracks().some((item) => item.id === track.id)) state.remoteStream.addTrack(track);
-      }
-      state.mediaReceived = true;
-      if (!state.reconnecting) renderParentMonitor();
-    };
-    state.connectionTimer = setTimeout(() => {
-      if (state.peer === pc && pc.connectionState !== 'connected' && !state.finalTermination) beginParentReconnect('automatic');
-    }, 10_000);
-    return pc;
-  }
+function clearParentCredentials() {
+  localStorage.removeItem('babymoon-parent-session');
+}
 
-  function createBabyPeer(parentId) {
-    closeBabyPeer(parentId);
-    const pc = new RTCPeerConnection({ iceServers: state.iceServers, iceCandidatePoolSize: 4 });
-    const context = {
-      parentId,
-      pc,
-      negotiationId: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
-      queuedCandidates: [],
-      negotiating: true,
-      retry: 0,
-      retryTimer: null,
-      connectionTimer: null
-    };
-    state.babyPeers.set(parentId, context);
-    pc.onicecandidate = (event) => sendBabySignal(context, { candidate: event.candidate ? event.candidate.toJSON() : null });
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
-        context.negotiating = false;
-        context.retry = 0;
-        clearTimeout(context.connectionTimer);
-      } else if (['failed', 'disconnected'].includes(pc.connectionState) && !state.finalTermination) {
-        context.negotiating = false;
-        scheduleBabyPeerRetry(parentId);
-      }
-    };
-    context.connectionTimer = setTimeout(() => {
-      if (state.babyPeers.get(parentId) === context && pc.connectionState !== 'connected') {
-        context.negotiating = false;
-        scheduleBabyPeerRetry(parentId);
-      }
-    }, 10_000);
-    return context;
-  }
+function initializeParentUi() {
+  state.sessionStartedAt = Date.now();
+  updateParentCapacity(state.parents);
+  applyDetectionSettings(state.detection);
+  applyNightMode();
+  setListening(state.listening);
+  $('adaptiveSwitch').checked = state.adaptiveVolume;
+  $('babyMicSwitch').checked = state.parents.micEnabled !== false;
+  clearInterval(state.sessionTimer);
+  state.sessionTimer = setInterval(updateSessionTimer, 1000);
+}
 
-  async function startOffer(parentId, iceRestart = false) {
-    if (state.role !== 'baby' || !parentId || !state.localStream || !state.sessionId || state.finalTermination) return;
-    const existing = state.babyPeers.get(parentId);
-    if (existing?.negotiating) return;
-    const context = createBabyPeer(parentId);
-    try {
-      for (const track of state.localStream.getTracks()) context.pc.addTrack(track, state.localStream);
-      const offer = await context.pc.createOffer({ iceRestart });
-      await context.pc.setLocalDescription(offer);
-      sendBabySignal(context, { description: context.pc.localDescription.toJSON() });
-      if (state.view !== 'baby-monitor') renderBabyMonitor();
-    } catch (_error) {
-      context.negotiating = false;
-      scheduleBabyPeerRetry(parentId);
-    }
-  }
+function updateSessionTimer() {
+  if (!state.sessionStartedAt) return;
+  const seconds = Math.floor((Date.now() - state.sessionStartedAt) / 1000);
+  $('sessionTimer').textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
 
-  async function handleSignal(message) {
-    if (!message?.signal) return;
-    const parentId = String(message.parentId || '');
-    try {
-      if (state.role === 'baby') {
-        if (message.signal.renegotiate) {
-          startOffer(parentId, true);
-          return;
-        }
-        const context = state.babyPeers.get(parentId);
-        if (!context || (message.negotiationId && context.negotiationId !== message.negotiationId)) return;
-        if (message.signal.description?.type === 'answer') {
-          await context.pc.setRemoteDescription(message.signal.description);
-          await flushBabyCandidates(context);
-          context.negotiating = false;
-        } else if (Object.prototype.hasOwnProperty.call(message.signal, 'candidate')) {
-          if (!context.pc.remoteDescription) context.queuedCandidates.push(message.signal.candidate);
-          else await context.pc.addIceCandidate(message.signal.candidate).catch(() => {});
-        }
-        return;
-      }
+function createPeerConnection() {
+  return new RTCPeerConnection({ iceServers: ICE_SERVERS, bundlePolicy: 'max-bundle' });
+}
 
-      if (parentId && state.parentId && parentId !== state.parentId) return;
-      if (message.signal.description?.type === 'offer') {
-        const pc = createParentPeer(message.negotiationId);
-        await pc.setRemoteDescription(message.signal.description);
-        await flushParentCandidates();
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sendParentSignal({ description: pc.localDescription.toJSON() });
-        if (!state.reconnecting) renderParentMonitor();
-      } else if (Object.prototype.hasOwnProperty.call(message.signal, 'candidate')) {
-        if (message.negotiationId && state.negotiationId && message.negotiationId !== state.negotiationId) return;
-        if (message.negotiationId && !state.negotiationId) state.negotiationId = message.negotiationId;
-        if (!state.peer?.remoteDescription) state.queuedCandidates.push(message.signal.candidate);
-        else await state.peer.addIceCandidate(message.signal.candidate).catch(() => {});
-      }
-    } catch (_error) {
-      if (state.role === 'baby') scheduleBabyPeerRetry(parentId);
-      else beginParentReconnect('automatic');
-    }
-  }
+async function createBabyPeer(parentId) {
+  closeBabyPeer(parentId);
+  const pc = createPeerConnection();
+  const negotiationId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  state.babyPeers.set(parentId, { pc, negotiationId });
+  for (const track of state.localStream.getTracks()) pc.addTrack(track, state.localStream);
+  pc.onicecandidate = ({ candidate }) => {
+    if (candidate) socket.emit('webrtc-signal', { sessionId: state.sessionId, token: state.babyToken, parentId, negotiationId, kind: 'ice', candidate });
+  };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed') pc.restartIce?.();
+    if (['closed', 'failed'].includes(pc.connectionState)) closeBabyPeer(parentId);
+  };
+  const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+  await pc.setLocalDescription(offer);
+  socket.emit('webrtc-signal', { sessionId: state.sessionId, token: state.babyToken, parentId, negotiationId, kind: 'offer', description: pc.localDescription });
+}
 
-  function sendBabySignal(context, signal) {
-    if (!state.sessionId || !state.token || !context) return;
-    socket.emit('signal', authPayload({ targetParentId: context.parentId, negotiationId: context.negotiationId, signal }));
-  }
-
-  function sendParentSignal(signal) {
-    if (!state.sessionId || !state.token) return;
-    socket.emit('signal', authPayload({ negotiationId: state.negotiationId, signal }));
-  }
-
-  async function flushBabyCandidates(context) {
-    const queued = context.queuedCandidates.splice(0);
-    for (const candidate of queued) await context.pc.addIceCandidate(candidate).catch(() => {});
-  }
-
-  async function flushParentCandidates() {
-    if (!state.peer?.remoteDescription) return;
-    const queued = state.queuedCandidates.splice(0);
-    for (const candidate of queued) await state.peer.addIceCandidate(candidate).catch(() => {});
-  }
-
-  function scheduleBabyPeerRetry(parentId) {
-    const context = state.babyPeers.get(parentId);
-    if (!context || state.finalTermination) return;
-    clearTimeout(context.retryTimer);
-    const delays = [0, 2000, 5000, 10_000];
-    const delay = delays[Math.min(context.retry, delays.length - 1)];
-    context.retry += 1;
-    context.retryTimer = setTimeout(() => {
-      const current = state.babyPeers.get(parentId);
-      if (current === context && socket.connected) {
-        current.negotiating = false;
-        startOffer(parentId, true);
-      }
-    }, delay);
-  }
-
-  function requestRetry() {
-    setBadge('Nuovo tentativo…', 'warn');
-    if (state.role === 'parent') {
-      if (state.reconnecting) reconnectParent();
-      else sendParentSignal({ renegotiate: true });
-    }
-  }
-
-  function closeBabyPeer(parentId) {
-    const context = state.babyPeers.get(parentId);
-    if (!context) return;
-    clearTimeout(context.retryTimer);
-    clearTimeout(context.connectionTimer);
-    context.pc.onicecandidate = null;
-    context.pc.onconnectionstatechange = null;
-    context.pc.close();
+function closeBabyPeer(parentId) {
+  const entry = state.babyPeers.get(parentId);
+  if (entry) {
+    entry.pc.ontrack = null;
+    entry.pc.onicecandidate = null;
+    entry.pc.close();
     state.babyPeers.delete(parentId);
   }
+}
 
-  function closeAllBabyPeers() {
-    for (const parentId of [...state.babyPeers.keys()]) closeBabyPeer(parentId);
+async function handleBabySignal(payload) {
+  const entry = state.babyPeers.get(payload.parentId);
+  if (!entry || payload.negotiationId !== entry.negotiationId) return;
+  if (payload.kind === 'answer') await entry.pc.setRemoteDescription(payload.description);
+  if (payload.kind === 'ice' && payload.candidate) await entry.pc.addIceCandidate(payload.candidate).catch(() => {});
+}
+
+async function handleParentSignal(payload) {
+  if (payload.kind === 'offer') {
+    closeParentPeer();
+    const pc = createPeerConnection();
+    state.parentPc = pc;
+    const negotiationId = payload.negotiationId;
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) socket.emit('webrtc-signal', { sessionId: state.sessionId, token: state.parentToken, negotiationId, kind: 'ice', candidate });
+    };
+    pc.ontrack = ({ streams, track }) => {
+      const stream = streams[0] || new MediaStream([track]);
+      state.remoteStream = stream;
+      const videoTracks = stream.getVideoTracks();
+      const audioTracks = stream.getAudioTracks();
+      if (videoTracks.length) $('remoteVideo').srcObject = new MediaStream(videoTracks);
+      if (audioTracks.length) $('remoteAudio').srcObject = new MediaStream(audioTracks);
+      onRemoteMediaReady();
+    };
+    pc.onconnectionstatechange = () => updateParentConnectionState(pc.connectionState);
+    await pc.setRemoteDescription(payload.description);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('webrtc-signal', { sessionId: state.sessionId, token: state.parentToken, negotiationId, kind: 'answer', description: pc.localDescription });
+  } else if (payload.kind === 'ice' && payload.candidate && state.parentPc) {
+    await state.parentPc.addIceCandidate(payload.candidate).catch(() => {});
   }
+}
 
-  function closeParentPeer(resetRemote = true) {
-    clearTimeout(state.connectionTimer);
-    clearInterval(state.statsTimer);
-    state.statsTimer = null;
-    if (state.peer) {
-      state.peer.ontrack = null;
-      state.peer.onicecandidate = null;
-      state.peer.onconnectionstatechange = null;
-      state.peer.close();
-    }
-    state.peer = null;
-    state.connected = false;
-    if (resetRemote) {
-      state.remoteStream = null;
-      remoteAudio.srcObject = null;
-    }
+function closeParentPeer() {
+  if (!state.parentPc) return;
+  state.parentPc.ontrack = null;
+  state.parentPc.onicecandidate = null;
+  state.parentPc.close();
+  state.parentPc = null;
+  $('remoteVideo').srcObject = null;
+  $('remoteAudio').srcObject = null;
+}
+
+async function onRemoteMediaReady() {
+  $('connectionOverlay').classList.add('hidden');
+  $('parentLiveBadge').textContent = 'LIVE';
+  $('parentLiveBadge').className = 'live-badge live';
+  $('streamHealth').textContent = 'Video ricevuto';
+  setHeaderStatus('LIVE', 'live');
+  try {
+    await $('remoteVideo').play();
+    if (state.listening) await $('remoteAudio').play();
+    $('audioUnlockButton').classList.add('hidden');
+    $('audioStateText').textContent = state.listening ? 'Ascolto attivo' : 'Ascolto disattivato';
+    if (state.adaptiveVolume) startAdaptiveVolume();
+  } catch {
+    if (state.listening) $('audioUnlockButton').classList.remove('hidden');
+    $('audioStateText').textContent = 'Audio da attivare';
   }
+}
 
-  function closePeer(resetRemote = true) {
-    closeParentPeer(resetRemote);
-    closeAllBabyPeers();
+function updateParentConnectionState(connectionState) {
+  if (connectionState === 'connected') {
+    setHeaderStatus('LIVE', 'live');
+    $('streamHealth').textContent = 'WebRTC connesso';
+  } else if (['disconnected', 'failed'].includes(connectionState)) {
+    setHeaderStatus('Riconnessione…', 'warning');
+    $('streamHealth').textContent = 'Connessione instabile';
+    if (!state.manualPause) attemptReconnect();
   }
+}
 
-  function clearParentReconnectTimers() {
-    clearTimeout(state.reconnectTimer);
-    clearInterval(state.reconnectTick);
-    state.reconnectTimer = null;
-    state.reconnectTick = null;
+function setListening(enabled) {
+  state.listening = Boolean(enabled);
+  localStorage.setItem('babymoon-listening', String(state.listening));
+  $('remoteAudio').muted = !state.listening;
+  $('listenSwitch').checked = state.listening;
+  $('listenToggle').classList.toggle('active', state.listening);
+  $('listenToggle').querySelector('span').textContent = state.listening ? '🔊' : '🔇';
+  $('listenToggle').querySelector('small').textContent = state.listening ? 'Ascolto' : 'Silenzioso';
+  $('audioStateIcon').textContent = state.listening ? '🔊' : '🔇';
+  $('audioStateText').textContent = state.listening ? 'Ascolto attivo' : 'Ascolto disattivato';
+  if (!state.listening) stopAdaptiveVolume();
+  else if (state.remoteStream) {
+    $('remoteAudio').play().then(() => $('audioUnlockButton').classList.add('hidden')).catch(() => $('audioUnlockButton').classList.remove('hidden'));
+    if (state.adaptiveVolume) startAdaptiveVolume();
   }
+}
 
-  function updateReconnectCountdown() {
-    const remaining = Math.max(0, Math.ceil((state.reconnectDeadline - Date.now()) / 1000));
-    const seconds = document.querySelector('#reconnectSeconds');
-    if (seconds) seconds.textContent = String(remaining);
-    if (state.reconnecting) setBadge(`Riconnessione · ${remaining}s`, 'warn');
-    if (remaining <= 0) expireParentReconnect();
-  }
-
-  function beginParentReconnect(mode = 'automatic', deadline = 0, serverRegistered = false) {
-    if (state.role !== 'parent' || state.finalTermination || !state.sessionId) return;
-    if (!state.reconnecting) {
-      state.reconnecting = true;
-      state.reconnectMode = mode;
-      state.reconnectDeadline = deadline || (Date.now() + 30_000);
-      state.reconnectAttempt = 0;
-      state.reconnectRegistered = serverRegistered || mode === 'manual';
-      closeParentPeer(false);
-      stopAdaptiveVolume();
-      remoteAudio.muted = true;
-      renderReconnectWindow();
-      state.reconnectTick = setInterval(updateReconnectCountdown, 500);
-      if (!state.reconnectRegistered && socket.connected) {
-        socket.emit('interrupt-parent', authPayload(), (response) => {
-          if (!state.reconnecting || !response?.ok) return;
-          state.reconnectRegistered = true;
-          if (response.deadline) state.reconnectDeadline = Math.min(state.reconnectDeadline, response.deadline);
-        });
-      }
-    } else if (deadline) {
-      state.reconnectDeadline = Math.min(state.reconnectDeadline || deadline, deadline);
-    }
-    if (mode === 'automatic' && state.reconnectMode !== 'manual') scheduleParentReconnectAttempt(0);
-  }
-
-  function scheduleParentReconnectAttempt(customDelay) {
-    if (!state.reconnecting || state.finalTermination || state.reconnectMode === 'manual') return;
-    clearTimeout(state.reconnectTimer);
-    const delays = [0, 2000, 5000, 8000, 10_000];
-    const delay = Number.isFinite(customDelay)
-      ? customDelay
-      : delays[Math.min(state.reconnectAttempt, delays.length - 1)];
-    state.reconnectAttempt += 1;
-    if (Date.now() + delay >= state.reconnectDeadline) return;
-    state.reconnectTimer = setTimeout(performParentReconnect, delay);
-  }
-
-  function performParentReconnect() {
-    if (!state.reconnecting || state.reconnectInFlight || state.finalTermination) return;
-    if (Date.now() >= state.reconnectDeadline) {
-      expireParentReconnect();
-      return;
-    }
-    if (!socket.connected) {
-      socket.connect();
-      scheduleParentReconnectAttempt(1000);
-      return;
-    }
-    state.reconnectInFlight = true;
-    const status = document.querySelector('#reconnectStatus');
-    if (status) status.textContent = `Tentativo ${state.reconnectAttempt || 1} in corso…`;
-    socket.emit('resume-session', authPayload(), (response) => {
-      state.reconnectInFlight = false;
-      if (!state.reconnecting || state.finalTermination) return;
-      if (!response?.ok) {
-        scheduleParentReconnectAttempt();
-        return;
-      }
-      state.parentId = response.parentId || state.parentId;
-      state.settings = response.settings || state.settings;
-      state.babyMicEnabled = response.babyState?.micEnabled !== false;
-      saveCredentials();
-      scheduleParentReconnectAttempt();
-    });
-  }
-
-  function reconnectParent() {
-    if (!state.reconnecting || Date.now() >= state.reconnectDeadline) return;
-    state.reconnectMode = 'automatic';
-    renderReconnectWindow();
-    performParentReconnect();
-  }
-
-  function completeParentReconnect() {
-    if (!state.reconnecting) return;
-    clearParentReconnectTimers();
-    state.reconnecting = false;
-    state.reconnectMode = '';
-    state.reconnectDeadline = 0;
-    state.reconnectAttempt = 0;
-    state.reconnectInFlight = false;
-    state.reconnectRegistered = false;
-    state.connected = true;
-    renderParentMonitor();
-    if (state.parentListening) {
-      remoteAudio.muted = false;
-      remoteAudio.play().catch(() => toast('Tocca “Ascolto” per riattivare l’audio.'));
-      if (state.adaptiveEnabled) startAdaptiveVolume();
-    }
-    toast('🟢 Sessione ristabilita');
-  }
-
-  function expireParentReconnect() {
-    if (!state.reconnecting) return;
-    clearParentReconnectTimers();
-    state.reconnecting = false;
-    state.finalTermination = true;
-    cleanup(false);
-    clearCredentials();
-    renderEnded('Finestra di riconnessione scaduta');
-  }
-
-  function interruptParent() {
-    if (state.role !== 'parent' || state.finalTermination || state.reconnecting) return;
-    socket.emit('interrupt-parent', authPayload(), (response) => {
-      if (!response?.ok) {
-        toast(response?.error || 'Impossibile interrompere il monitoraggio.');
-        return;
-      }
-      beginParentReconnect('manual', response.deadline, true);
-    });
-  }
-
-  function attachLocalVideo() {
-    const video = document.querySelector('#localVideo');
-    if (video && state.localStream) {
-      video.srcObject = state.localStream;
-      video.play().catch(() => {});
-    }
-  }
-
-  function attachRemoteMedia() {
-    const video = document.querySelector('#remoteVideo');
-    if (state.remoteStream) {
-      if (video) {
-        video.srcObject = state.remoteStream;
-        video.muted = true;
-        video.play().catch(() => {});
-      }
-      if (remoteAudio.srcObject !== state.remoteStream) remoteAudio.srcObject = state.remoteStream;
-      remoteAudio.muted = !state.parentListening;
-      remoteAudio.volume = state.adaptiveEnabled ? state.adaptiveLevel : 1;
-    }
-  }
-
-  async function toggleListening() {
-    if (!state.remoteStream?.getAudioTracks().length) {
-      toast('Audio Baby non ancora disponibile.');
-      return;
-    }
-    if (state.parentListening) {
-      state.parentListening = false;
-      remoteAudio.muted = true;
-          if (!state.reconnecting) renderParentMonitor();
-      return;
-    }
-    state.parentListening = true;
-    remoteAudio.srcObject = state.remoteStream;
-    remoteAudio.muted = false;
-    remoteAudio.volume = state.adaptiveEnabled ? state.adaptiveLevel : 1;
-    try {
-      await remoteAudio.play();
-      if (state.adaptiveEnabled) await startAdaptiveVolume();
-      renderParentMonitor();
-    } catch (_error) {
-      state.parentListening = false;
-      remoteAudio.muted = true;
-      toast('Il browser ha bloccato l’audio. Tocca di nuovo “Attiva audio”.', 5000);
-      renderParentMonitor();
-    }
-  }
-
-  async function toggleAdaptive() {
-    state.adaptiveEnabled = !state.adaptiveEnabled;
-    if (state.adaptiveEnabled) {
-      state.adaptiveLevel = 0.55;
-      if (state.parentListening) await startAdaptiveVolume();
-    } else {
-      stopAdaptiveVolume();
-      remoteAudio.volume = 1;
-    }
-    renderParentMonitor();
-  }
-
-  async function startAdaptiveVolume() {
+function setAdaptiveVolume(enabled) {
+  state.adaptiveVolume = Boolean(enabled);
+  localStorage.setItem('babymoon-adaptive', String(state.adaptiveVolume));
+  $('adaptiveSwitch').checked = state.adaptiveVolume;
+  if (state.adaptiveVolume && state.remoteStream && state.listening) startAdaptiveVolume();
+  else {
     stopAdaptiveVolume();
-    if (!state.remoteStream || !state.parentListening) return;
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return;
-    const context = new AudioContextClass();
-    const analyser = context.createAnalyser();
-    analyser.fftSize = 1024;
-    analyser.smoothingTimeConstant = 0.8;
-    const audioOnly = new MediaStream(state.remoteStream.getAudioTracks());
-    context.createMediaStreamSource(audioOnly).connect(analyser);
-    await context.resume().catch(() => {});
-    state.adaptiveContext = context;
-    state.adaptiveAnalyser = analyser;
-    let activeMs = 0;
-    let quietMs = 0;
-    const buffer = new Float32Array(analyser.fftSize);
-    state.adaptiveTimer = setInterval(() => {
-      if (!state.adaptiveEnabled || !state.parentListening) return;
-      analyser.getFloatTimeDomainData(buffer);
-      let sum = 0;
-      for (const sample of buffer) sum += sample * sample;
-      const rms = Math.sqrt(sum / buffer.length);
-      if (rms > 0.055) {
-        activeMs += 250;
-        quietMs = 0;
-      } else {
-        quietMs += 250;
-        activeMs = Math.max(0, activeMs - 250);
-      }
-      if (activeMs >= 1000) {
-        state.adaptiveLevel = Math.max(0.22, state.adaptiveLevel - 0.025);
-        activeMs = 750;
-      } else if (quietMs >= 2000) {
-        state.adaptiveLevel = Math.min(0.70, state.adaptiveLevel + 0.015);
-        quietMs = 1500;
-      }
-      const next = remoteAudio.volume + (state.adaptiveLevel - remoteAudio.volume) * 0.35;
-      remoteAudio.volume = Math.max(0.22, Math.min(0.70, next));
-      const label = document.querySelector('#adaptiveBadge');
-      if (label) label.textContent = `Volume adattivo ${Math.round(remoteAudio.volume * 100)}%`;
-    }, 250);
+    $('remoteAudio').volume = 1;
+    $('adaptiveVolumeLabel').textContent = state.adaptiveVolume ? 'Volume adattivo' : 'Volume normale';
   }
+}
 
-  function stopAdaptiveVolume() {
+function startAdaptiveVolume() {
+  stopAdaptiveVolume();
+  const audioTrack = state.remoteStream?.getAudioTracks()[0];
+  if (!audioTrack) return;
+  try {
+    const context = new AudioContext();
+    state.adaptiveAudioContext = context;
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 256;
+    context.createMediaStreamSource(new MediaStream([audioTrack])).connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    let level = Math.max(.22, Math.min(.7, $('remoteAudio').volume || .55));
+    state.adaptiveTimer = setInterval(() => {
+      analyser.getByteFrequencyData(data);
+      const average = data.reduce((sum, value) => sum + value, 0) / data.length;
+      const target = average > 48 ? .22 : average > 30 ? .38 : .62;
+      level += (target - level) * (target < level ? .16 : .045);
+      $('remoteAudio').volume = Math.max(.22, Math.min(.7, level));
+      $('adaptiveVolumeLabel').textContent = `Volume adattivo ${Math.round($('remoteAudio').volume * 100)}%`;
+    }, 500);
+  } catch (error) {
+    console.info('Volume adattivo non disponibile', error.message);
+  }
+}
+
+function stopAdaptiveVolume() {
+  if (state.adaptiveTimer) {
     clearInterval(state.adaptiveTimer);
     state.adaptiveTimer = null;
-    if (state.adaptiveContext) state.adaptiveContext.close().catch(() => {});
-    state.adaptiveContext = null;
-    state.adaptiveAnalyser = null;
   }
+  state.adaptiveAudioContext?.close().catch(() => {});
+  state.adaptiveAudioContext = null;
+}
 
-  function toggleBabyMic() {
-    const enabled = !state.babyMicEnabled;
-    if (!enabled && !window.confirm('Disattivare il microfono Baby? Non sentirai più l’audio e il rilevamento del possibile pianto verrà sospeso.')) return;
-    socket.emit('control', authPayload({ command: 'set-baby-mic', enabled }), (response) => {
-      if (!response?.ok) toast(response?.error || 'Comando non riuscito.');
+function cycleNightMode() {
+  const modes = ['auto', 'on', 'off'];
+  state.nightMode = modes[(modes.indexOf(state.nightMode) + 1) % modes.length];
+  localStorage.setItem('babymoon-night-mode', state.nightMode);
+  applyNightMode();
+}
+
+function applyNightMode() {
+  const frame = $('parentVideoFrame');
+  frame.classList.remove('night-auto', 'night-on', 'night-off');
+  frame.classList.add(`night-${state.nightMode}`);
+  frame.classList.toggle('low-light', state.environment.lowLight);
+  $('nightModeSelect').value = state.nightMode;
+  const labels = { auto: 'Notte: Auto', on: 'Notte: Sì', off: 'Notte: No' };
+  $('nightModeButton').querySelector('small').textContent = labels[state.nightMode];
+  const active = state.nightMode === 'on' || (state.nightMode === 'auto' && state.environment.lowLight);
+  $('nightModeButton').classList.toggle('active', active);
+  $('nightBadge').classList.toggle('hidden', !active);
+}
+
+async function pauseParent() {
+  if (state.manualPause) return;
+  try {
+    const response = await emitAck('parent-pause', { sessionId: state.sessionId, parentId: state.parentId, parentToken: state.parentToken });
+    state.manualPause = true;
+    state.reconnectUntil = response.reconnectUntil;
+    saveParentCredentials();
+    closeParentPeer();
+    stopAdaptiveVolume();
+    $('reconnectCard').classList.remove('hidden');
+    $('connectionOverlay').classList.remove('hidden');
+    $('connectionOverlay').querySelector('strong').textContent = 'Monitor interrotto';
+    $('connectionOverlay').querySelector('small').textContent = 'Riconnessione automatica tra pochi secondi';
+    startReconnectCountdown(true);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+function startReconnectCountdown(auto = false) {
+  clearInterval(state.reconnectTimer);
+  const started = Date.now();
+  state.reconnectTimer = setInterval(() => {
+    const remaining = Math.max(0, Math.ceil((state.reconnectUntil - Date.now()) / 1000));
+    $('reconnectCountdown').textContent = `Riconnessione disponibile per ${remaining} s`;
+    if (auto && Date.now() - started > 3000 && remaining > 0) {
+      clearInterval(state.reconnectTimer);
+      attemptReconnect();
+    } else if (!remaining) {
+      clearInterval(state.reconnectTimer);
+      clearParentCredentials();
+      $('reconnectCountdown').textContent = 'Finestra scaduta: usa un nuovo invito.';
+    }
+  }, 250);
+}
+
+async function attemptReconnect() {
+  if (!state.sessionId || !state.parentToken || Date.now() > state.reconnectUntil) return;
+  try {
+    const response = await emitAck('reconnect-session', {
+      sessionId: state.sessionId,
+      parentId: state.parentId,
+      parentToken: state.parentToken
     });
+    state.manualPause = false;
+    state.reconnectUntil = response.reconnectUntil;
+    state.parents = response.status;
+    saveParentCredentials();
+    $('reconnectCard').classList.add('hidden');
+    $('connectionOverlay').classList.remove('hidden');
+    $('connectionOverlay').querySelector('strong').textContent = 'Ricollegamento in corso…';
+    $('connectionOverlay').querySelector('small').textContent = 'Ripristino del flusso protetto';
+    updateParentCapacity(response.status);
+  } catch (error) {
+    if (error.code === 'RECONNECT_EXPIRED') {
+      clearParentCredentials();
+      showScreen('joinScreen');
+      showInlineError('joinError', error);
+    }
   }
+}
 
-  function setBabyMic(enabled) {
-    const track = state.localStream?.getAudioTracks()[0];
-    if (!track) return;
-    track.enabled = Boolean(enabled);
-    state.babyMicEnabled = track.enabled;
-    applyDetectorSettings();
-    socket.emit('baby-state', authPayload({ micEnabled: state.babyMicEnabled, cryAvailable: state.babyMicEnabled }));
-    if (state.view === 'baby-monitor') renderBabyMonitor();
+async function switchCamera() {
+  const oldVideo = state.localStream?.getVideoTracks()[0];
+  state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
+  try {
+    const fresh = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: state.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    const newVideo = fresh.getVideoTracks()[0];
+    const tracks = [newVideo, ...state.localStream.getAudioTracks()];
+    state.localStream = new MediaStream(tracks);
+    $('localVideo').srcObject = state.localStream;
+    for (const { pc } of state.babyPeers.values()) {
+      const sender = pc.getSenders().find((item) => item.track?.kind === 'video');
+      await sender?.replaceTrack(newVideo);
+    }
+    oldVideo?.stop();
+  } catch (error) {
+    state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
+    showToast('Non è stato possibile cambiare fotocamera.');
   }
+}
 
-  function updateSettings(next) {
-    const settings = { ...state.settings, ...next };
-    socket.emit('update-settings', authPayload({ settings }), (response) => {
-      if (!response?.ok) {
-        toast(response?.error || 'Impostazioni non aggiornate.');
-        return;
+function startLocalAnalysis() {
+  stopLocalAnalysis();
+  state.analysis.running = true;
+  const canvas = document.createElement('canvas');
+  canvas.width = 32;
+  canvas.height = 24;
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const video = $('localVideo');
+  const sensitivityThresholds = { low: { cry: .16, motion: 28 }, medium: { cry: .11, motion: 20 }, high: { cry: .075, motion: 13 } };
+
+  const videoTimer = setInterval(() => {
+    if (!state.analysis.running || video.readyState < 2) return;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const gray = new Uint8Array(canvas.width * canvas.height);
+    let luminance = 0;
+    for (let i = 0, j = 0; i < pixels.length; i += 4, j += 1) {
+      gray[j] = Math.round(.2126 * pixels[i] + .7152 * pixels[i + 1] + .0722 * pixels[i + 2]);
+      luminance += gray[j];
+    }
+    luminance /= gray.length;
+    state.environment = { luminance, lowLight: luminance < 52 };
+    $('babyLightBadge').textContent = luminance < 52 ? '☾ Luce bassa' : '☀ Luce buona';
+    socket.emit('environment-status', { sessionId: state.sessionId, token: state.babyToken, luminance });
+
+    if (state.detection.motion && state.analysis.previousFrame) {
+      let difference = 0;
+      for (let i = 0; i < gray.length; i += 1) difference += Math.abs(gray[i] - state.analysis.previousFrame[i]);
+      const score = difference / gray.length;
+      const threshold = sensitivityThresholds[state.detection.sensitivity].motion;
+      if (score > threshold && Date.now() - state.analysis.lastMotion > state.detection.cooldown * 1000) {
+        state.analysis.lastMotion = Date.now();
+        socket.emit('detection-event', { sessionId: state.sessionId, token: state.babyToken, type: 'motion', confidence: Math.min(1, score / (threshold * 2)) });
       }
-      state.settings = response.settings;
-      renderParentMonitor();
-    });
-  }
+    }
+    state.analysis.previousFrame = gray;
+  }, 1800);
+  state.analysis.timers.push(videoTimer);
 
-  function receiveAlert(alert) {
-    if (!['cry', 'motion'].includes(alert?.type)) return;
-    state.alerts.unshift({ type: alert.type, at: alert.at || Date.now() });
-    state.alerts = state.alerts.slice(0, 50);
-    const message = alert.type === 'cry' ? '👶 Possibile pianto rilevato' : '〰️ Movimento rilevato';
-    toast(message, 6000);
-    if (navigator.vibrate) navigator.vibrate([180, 90, 180]);
-    playAlertTone();
-    if (state.view === 'parent-monitor') renderParentMonitor();
+  const audioTrack = state.localStream?.getAudioTracks()[0];
+  if (audioTrack) {
+    try {
+      const audioContext = new AudioContext();
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 1024;
+      audioContext.createMediaStreamSource(new MediaStream([audioTrack])).connect(analyser);
+      const values = new Float32Array(analyser.fftSize);
+      state.analysis.audioContext = audioContext;
+      const audioTimer = setInterval(() => {
+        if (!state.detection.cry || !audioTrack.enabled) return;
+        analyser.getFloatTimeDomainData(values);
+        let sum = 0;
+        let crossings = 0;
+        for (let i = 0; i < values.length; i += 1) {
+          sum += values[i] * values[i];
+          if (i && Math.sign(values[i]) !== Math.sign(values[i - 1])) crossings += 1;
+        }
+        const rms = Math.sqrt(sum / values.length);
+        const crossingRate = crossings / values.length;
+        const threshold = sensitivityThresholds[state.detection.sensitivity].cry;
+        const cryLike = rms > threshold && crossingRate > .04 && crossingRate < .32;
+        state.analysis.cryFrames = cryLike ? state.analysis.cryFrames + 1 : Math.max(0, state.analysis.cryFrames - 1);
+        if (state.analysis.cryFrames >= 4 && Date.now() - state.analysis.lastCry > state.detection.cooldown * 1000) {
+          state.analysis.lastCry = Date.now();
+          state.analysis.cryFrames = 0;
+          socket.emit('detection-event', { sessionId: state.sessionId, token: state.babyToken, type: 'cry', confidence: Math.min(1, rms / (threshold * 2)) });
+        }
+      }, 500);
+      state.analysis.timers.push(audioTimer);
+    } catch (error) {
+      console.info('Analisi audio non disponibile', error.message);
+    }
   }
+}
 
-  function playAlertTone() {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return;
-    const context = new AudioContextClass();
+function stopLocalAnalysis() {
+  state.analysis.running = false;
+  state.analysis.timers.forEach(clearInterval);
+  state.analysis.timers = [];
+  state.analysis.audioContext?.close().catch(() => {});
+  state.analysis.audioContext = null;
+}
+
+function applyDetectionSettings(settings) {
+  state.detection = settings;
+  $('crySwitch').checked = settings.cry;
+  $('motionSwitch').checked = settings.motion;
+  $('sensitivitySelect').value = settings.sensitivity;
+  if ($('babyDetectorBadge')) {
+    const active = [settings.cry && state.parents.micEnabled !== false, settings.motion].filter(Boolean).length;
+    $('babyDetectorBadge').textContent = active ? `${active} rilevator${active === 1 ? 'e' : 'i'} attiv${active === 1 ? 'o' : 'i'}` : 'Rilevatori sospesi';
+  }
+}
+
+async function saveDetectionSettings() {
+  if (state.role !== 'parent') return;
+  const payload = {
+    sessionId: state.sessionId, parentId: state.parentId, parentToken: state.parentToken,
+    cry: $('crySwitch').checked, motion: $('motionSwitch').checked,
+    sensitivity: $('sensitivitySelect').value, cooldown: state.detection.cooldown
+  };
+  try {
+    const response = await emitAck('set-detection', payload);
+    applyDetectionSettings(response.detection);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function setBabyMicrophone(enabled) {
+  try {
+    const response = await emitAck('set-baby-microphone', { sessionId: state.sessionId, parentId: state.parentId, parentToken: state.parentToken, enabled });
+    $('babyMicSwitch').checked = response.enabled;
+  } catch (error) {
+    $('babyMicSwitch').checked = !enabled;
+    showToast(error.message);
+  }
+}
+
+function addDetectionEvent(event) {
+  state.eventLog.unshift(event);
+  state.eventLog = state.eventLog.slice(0, 50);
+  renderTimeline();
+  const label = event.type === 'cry' ? 'Possibile pianto rilevato' : 'Movimento rilevato';
+  $('alertOverlay').textContent = `${event.type === 'cry' ? '👶' : '〰'} ${label}`;
+  $('alertOverlay').classList.remove('hidden');
+  setTimeout(() => $('alertOverlay').classList.add('hidden'), 5000);
+  navigator.vibrate?.([120, 80, 120]);
+  playAlertTone();
+}
+
+function renderTimeline() {
+  if (!state.eventLog.length) {
+    $('eventTimeline').innerHTML = '<p class="empty-state">Nessun evento rilevato.</p>';
+    return;
+  }
+  $('eventTimeline').innerHTML = state.eventLog.map((event) => `
+    <div class="timeline-item"><span>${event.type === 'cry' ? '👶' : '〰'}</span><div><strong>${event.type === 'cry' ? 'Possibile pianto' : 'Movimento'}</strong><small>Stima locale · ${Math.round(event.confidence * 100)}%</small></div><time>${new Date(event.at).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}</time></div>`).join('');
+}
+
+function playAlertTone() {
+  try {
+    const context = new AudioContext();
     const oscillator = context.createOscillator();
     const gain = context.createGain();
     oscillator.frequency.value = 660;
-    gain.gain.setValueAtTime(0.0001, context.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.32);
+    gain.gain.setValueAtTime(.0001, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(.08, context.currentTime + .02);
+    gain.gain.exponentialRampToValueAtTime(.0001, context.currentTime + .35);
     oscillator.connect(gain).connect(context.destination);
-    oscillator.start();
-    oscillator.stop(context.currentTime + 0.34);
-    oscillator.onended = () => context.close().catch(() => {});
-  }
+    oscillator.start(); oscillator.stop(context.currentTime + .36);
+    oscillator.onended = () => context.close();
+  } catch {}
+}
 
-  async function switchCamera() {
-    if (!state.localStream) return;
-    const oldTrack = state.localStream.getVideoTracks()[0];
-    state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
-    try {
-      const fresh = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: state.facingMode } }, audio: false });
-      const newTrack = fresh.getVideoTracks()[0];
-      const replacements = [];
-      for (const context of state.babyPeers.values()) {
-        const sender = context.pc.getSenders().find((item) => item.track?.kind === 'video');
-        if (sender) replacements.push(sender.replaceTrack(newTrack));
-      }
-      await Promise.all(replacements);
-      if (oldTrack) {
-        state.localStream.removeTrack(oldTrack);
-        oldTrack.stop();
-      }
-      state.localStream.addTrack(newTrack);
-      state.analysisVideo.srcObject = state.localStream;
-      attachLocalVideo();
-    } catch (_error) {
-      state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
-      toast('Impossibile cambiare fotocamera.');
+async function refreshDiagnostics() {
+  try {
+    const response = await emitAck('diagnostics-request', authPayload());
+    let webrtc = state.role === 'parent' ? state.parentPc?.connectionState : [...state.babyPeers.values()].map(({ pc }) => pc.connectionState).join(', ');
+    let media = '—';
+    const pc = state.role === 'parent' ? state.parentPc : state.babyPeers.values().next().value?.pc;
+    if (pc) {
+      const stats = await pc.getStats();
+      let inboundVideo = 0, inboundAudio = 0;
+      stats.forEach((item) => {
+        if (item.type === 'inbound-rtp' && item.kind === 'video') inboundVideo += item.framesDecoded || 0;
+        if (item.type === 'inbound-rtp' && item.kind === 'audio') inboundAudio += item.totalSamplesReceived || item.packetsReceived || 0;
+      });
+      media = state.role === 'parent' ? `video ${inboundVideo} · audio ${inboundAudio}` : `${state.localStream?.getTracks().length || 0} tracce locali`;
     }
+    $('diagnosticsGrid').innerHTML = `<span>Versione</span><strong>${response.version}</strong><span>WebRTC</span><strong>${webrtc || 'in attesa'}</strong><span>Media</span><strong>${media}</strong><span>Trasporto</span><strong>${response.transport}</strong><span>Parent</span><strong>${response.parentCount}/${response.maxParents}</strong><span>Slot liberi</span><strong>${response.availableSlots}</strong><span>Inviti attivi</span><strong>${response.activePairings}</strong><span>Luminanza</span><strong>${response.environment.luminance == null ? '—' : Math.round(response.environment.luminance)}</strong>`;
+  } catch (error) {
+    showToast(error.message);
   }
+}
 
-  function enterDarkMode() {
-    darkOverlay.classList.remove('hidden');
-    if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => {});
-  }
+async function endBabySession() {
+  if (!confirm('Terminare la sessione per Baby e tutti i Parent?')) return;
+  await emitAck('end-session', { sessionId: state.sessionId, babyToken: state.babyToken }).catch(() => {});
+  cleanupAll();
+  location.href = '/';
+}
 
-  function exitDarkMode() {
-    darkOverlay.classList.add('hidden');
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-  }
+function cleanupAll() {
+  closeParentPeer();
+  for (const parentId of [...state.babyPeers.keys()]) closeBabyPeer(parentId);
+  state.localStream?.getTracks().forEach((track) => track.stop());
+  state.remoteStream?.getTracks().forEach((track) => track.stop());
+  state.scannerStream?.getTracks().forEach((track) => track.stop());
+  stopLocalAnalysis();
+  stopAdaptiveVolume();
+  clearInterval(state.sessionTimer);
+  clearInterval(state.reconnectTimer);
+  state.wakeLock?.release().catch(() => {});
+}
 
-  async function requestWakeLock() {
-    if (!navigator.wakeLock?.request) return;
-    try { state.wakeLock = await navigator.wakeLock.request('screen'); } catch (_error) { /* unsupported/denied */ }
-  }
-
-  function fullscreenParent() {
-    const shell = document.querySelector('#remoteShell');
-    if (shell?.requestFullscreen) shell.requestFullscreen().catch(() => {});
-    else document.querySelector('#remoteVideo')?.webkitEnterFullscreen?.();
-  }
-
-  function startStats() {
-    clearInterval(state.statsTimer);
-    state.statsTimer = setInterval(async () => {
-      if (!state.peer) return;
-      try {
-        const reports = await state.peer.getStats();
-        let audioBytes = 0;
-        let videoBytes = 0;
-        let path = state.diagnostics.path;
-        reports.forEach((report) => {
-          if (report.type === 'inbound-rtp' && !report.isRemote) {
-            if (report.kind === 'audio' || report.mediaType === 'audio') audioBytes = report.bytesReceived || 0;
-            if (report.kind === 'video' || report.mediaType === 'video') videoBytes = report.bytesReceived || 0;
-          }
-          if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
-            const local = reports.get(report.localCandidateId);
-            const remote = reports.get(report.remoteCandidateId);
-            path = local?.candidateType === 'relay' || remote?.candidateType === 'relay'
-              ? 'Relay TURN'
-              : `Diretta P2P${local?.protocol ? ` · ${local.protocol}` : ''}`;
-          }
-        });
-        state.diagnostics.audioBytes = audioBytes;
-        state.diagnostics.videoBytes = videoBytes;
-        state.diagnostics.path = path;
-        updateDiagnostics();
-      } catch (_error) { /* stats are diagnostic only */ }
-    }, 3000);
-  }
-
-  function updateDiagnostics() {
-    const rtc = document.querySelector('#diagRtc');
-    const ice = document.querySelector('#diagIce');
-    const path = document.querySelector('#diagPath');
-    const media = document.querySelector('#diagMedia');
-    if (rtc) rtc.textContent = state.diagnostics.rtc;
-    if (ice) ice.textContent = state.diagnostics.ice;
-    if (path) path.textContent = state.diagnostics.path;
-    if (media) media.textContent = `audio ${state.diagnostics.audioBytes} · video ${state.diagnostics.videoBytes}`;
-  }
-
-  async function stopLocalMedia() {
-    state.localStream?.getTracks().forEach((track) => track.stop());
-    state.localStream = null;
-    state.cryDetector?.stop();
-    state.motionDetector?.stop();
-    state.cryDetector = null;
-    state.motionDetector = null;
-    state.analysisVideo = null;
-    if (state.wakeLock) await state.wakeLock.release().catch(() => {});
-    state.wakeLock = null;
-  }
-
-  function endSession() {
-    state.finalTermination = true;
-    clearParentReconnectTimers();
-    if (!state.sessionId || !state.token) {
-      cleanup();
-      renderHome();
-      return;
+async function openScanner() {
+  clearInlineError('scannerError');
+  $('scannerDialog').showModal();
+  try {
+    state.scannerStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    $('scannerVideo').srcObject = state.scannerStream;
+    await $('scannerVideo').play();
+    if ('BarcodeDetector' in window) {
+      try { state.detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch { state.detector = null; }
     }
-    socket.emit('end-session', authPayload(), () => {});
-    cleanup();
-    clearCredentials();
-    renderEnded('Sessione terminata');
+    scanQrFrame();
+  } catch (error) {
+    showInlineError('scannerError', new Error('Fotocamera non disponibile. Puoi scegliere una foto del QR o inserire il PIN.'));
   }
+}
 
-  function cleanup(resetRole = true) {
-    clearParentReconnectTimers();
-    state.reconnecting = false;
-    state.reconnectInFlight = false;
-    state.reconnectRegistered = false;
-    closePeer();
-    stopAdaptiveVolume();
-    stopLocalMedia();
-    clearTimeout(state.peerRetryTimer);
-    state.parentListening = false;
-    state.alerts = [];
-    state.connected = false;
-    remoteAudio.pause();
-    remoteAudio.srcObject = null;
-    darkOverlay.classList.add('hidden');
-    if (resetRole) state.role = 'home';
+async function scanQrFrame() {
+  const video = $('scannerVideo');
+  if (!$('scannerDialog').open || !state.scannerStream) return;
+  try {
+    let rawValue = null;
+    if (state.detector) {
+      const codes = await state.detector.detect(video);
+      rawValue = codes[0]?.rawValue;
+    } else if (video.readyState >= 2 && window.jsQR) {
+      const canvas = $('scannerCanvas');
+      const size = Math.min(video.videoWidth, video.videoHeight);
+      canvas.width = 480; canvas.height = 480;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      context.drawImage(video, (video.videoWidth - size) / 2, (video.videoHeight - size) / 2, size, size, 0, 0, 480, 480);
+      const image = context.getImageData(0, 0, 480, 480);
+      rawValue = jsQR(image.data, image.width, image.height, { inversionAttempts: 'dontInvert' })?.data;
+    }
+    if (rawValue && handleQrValue(rawValue)) return;
+  } catch {}
+  state.scannerFrame = setTimeout(scanQrFrame, 180);
+}
+
+function handleQrValue(rawValue) {
+  try {
+    const url = new URL(rawValue, location.origin);
+    const invite = parseInvite(url.searchParams.get('invite'));
+    if (!invite) throw new Error();
+    closeScanner();
+    joinSession({ invite });
+    return true;
+  } catch {
+    showInlineError('scannerError', new Error('Questo QR non è un invito BabyMoon valido.'));
+    return false;
   }
+}
 
-  function goHome() {
-    if (state.sessionId && state.token && state.view !== 'ended') {
-      if (!window.confirm('Terminare la sessione attiva e tornare alla Home?')) return;
-      endSession();
-      return;
-    }
-    cleanup();
-    clearCredentials();
-    renderHome();
+function closeScanner() {
+  clearTimeout(state.scannerFrame);
+  state.scannerStream?.getTracks().forEach((track) => track.stop());
+  state.scannerStream = null;
+  $('scannerVideo').srcObject = null;
+  if ($('scannerDialog').open) $('scannerDialog').close();
+}
+
+async function scanQrImage(file) {
+  if (!file || !window.jsQR) return;
+  try {
+    const bitmap = await createImageBitmap(file);
+    const canvas = $('scannerCanvas');
+    const scale = Math.min(1, 1200 / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const image = context.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(image.data, image.width, image.height)?.data;
+    if (!code || !handleQrValue(code)) throw new Error();
+  } catch {
+    showInlineError('scannerError', new Error('QR non riconosciuto nella foto. Prova ad avvicinarti o usa il PIN.'));
   }
+}
 
-  app.addEventListener('submit', (event) => {
-    if (event.target.id !== 'pinForm') return;
-    event.preventDefault();
-    const pin = document.querySelector('#pinInput')?.value.replace(/\D/g, '');
-    if (pin?.length !== 6) {
-      toast('Inserisci un PIN di 6 cifre.');
-      return;
-    }
-    pairWithPin(pin);
-  });
-
-  app.addEventListener('input', (event) => {
-    if (event.target.id === 'pinInput') event.target.value = event.target.value.replace(/\D/g, '').slice(0, 6);
-  });
-
-  app.addEventListener('change', (event) => {
-    if (event.target.dataset.setting === 'sensitivity') updateSettings({ sensitivity: event.target.value });
-    if (event.target.dataset.setting === 'cooldownSeconds') updateSettings({ cooldownSeconds: Number(event.target.value) });
-  });
-
-  document.addEventListener('click', (event) => {
-    const action = event.target.closest('[data-action]')?.dataset.action;
-    if (!action) return;
-    const actions = {
-      home: goHome,
-      'finish-home': () => { cleanup(); clearCredentials(); renderHome(); },
-      'choose-baby': () => renderBabyPermission(false),
-      'choose-parent': () => renderParentPairing(),
-      'start-baby': () => startBaby(false),
-      'resume-baby': () => startBaby(true),
-      'toggle-listening': toggleListening,
-      'toggle-adaptive': toggleAdaptive,
-      'toggle-baby-mic': toggleBabyMic,
-      'toggle-cry': () => updateSettings({ cryEnabled: !state.settings.cryEnabled }),
-      'toggle-motion': () => updateSettings({ motionEnabled: !state.settings.motionEnabled }),
-      'switch-camera': switchCamera,
-      dark: enterDarkMode,
-      retry: requestRetry,
-      'interrupt-parent': interruptParent,
-      'reconnect-parent': reconnectParent,
-      fullscreen: fullscreenParent,
-      end: endSession
-    };
-    actions[action]?.();
-  });
-
-  darkOverlay.addEventListener('pointerup', exitDarkMode);
-  darkOverlay.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') exitDarkMode(); });
-
-  socket.on('connect', () => {
-    if (state.pendingQr) pairWithQr(state.pendingQr);
-    else if (state.reconnecting && state.role === 'parent') performParentReconnect();
-    else if (state.sessionId && state.token && (state.role !== 'baby' || state.localStream)) resumeSession();
-    else if (state.view === 'home') setBadge('Pronto', 'neutral');
-  });
-  socket.on('disconnect', () => {
-    if (state.sessionId && state.role === 'parent' && !state.finalTermination) beginParentReconnect('automatic', 0, true);
-    else if (state.sessionId) setBadge('Riconnessione…', 'warn');
-  });
-  socket.on('peer-ready', (payload) => {
-    if (payload?.settings) state.settings = payload.settings;
-    if (payload?.babyState) state.babyMicEnabled = payload.babyState.micEnabled !== false;
-    if (payload?.parentId && state.role === 'parent') state.parentId = payload.parentId;
-    if (state.role === 'baby') startOffer(payload?.parentId, false);
-    else if (!state.reconnecting) renderConnecting();
-  });
-  socket.on('signal', handleSignal);
-  socket.on('control', (payload) => {
-    if (state.role === 'baby' && payload?.command === 'set-baby-mic' && typeof payload.enabled === 'boolean') setBabyMic(payload.enabled);
-  });
-  socket.on('baby-state', (payload) => {
-    state.babyMicEnabled = payload?.micEnabled !== false;
-    if (state.view === 'parent-monitor') renderParentMonitor();
-  });
-  socket.on('settings-updated', (settings) => {
-    state.settings = { ...state.settings, ...settings };
-    applyDetectorSettings();
-    if (state.view === 'baby-monitor') renderBabyMonitor();
-    if (state.view === 'parent-monitor') renderParentMonitor();
-  });
-  socket.on('alert', receiveAlert);
-  socket.on('parent-count', (payload) => {
-    state.parentCount = Number(payload?.connected) || 0;
-    state.authorizedParentCount = Number(payload?.authorized) || 0;
-    state.maxParents = Number(payload?.maximum) || state.maxParents;
-    if (state.view === 'baby-monitor') renderBabyMonitor();
-    if (state.view === 'parent-monitor') renderParentMonitor();
-  });
-  socket.on('peer-interrupted', (payload) => {
-    if (state.role === 'baby' && payload?.parentId) {
-      closeBabyPeer(payload.parentId);
-      if (state.view === 'baby-monitor') renderBabyMonitor();
-    }
-  });
-  socket.on('parent-expired', (payload) => {
-    if (state.role === 'baby' && payload?.parentId) closeBabyPeer(payload.parentId);
-  });
-  socket.on('peer-disconnected', (payload) => {
-    if (state.role === 'baby' && payload?.role === 'parent' && payload?.parentId) {
-      closeBabyPeer(payload.parentId);
-      return;
-    }
-    if (state.role === 'parent' && payload?.role === 'baby') beginParentReconnect('automatic', 0, true);
-  });
-  socket.on('parent-session-ended', () => {
-    state.finalTermination = true;
-    cleanup(false);
-    clearCredentials();
-    renderEnded('Finestra di riconnessione scaduta');
-  });
-  socket.on('session-ended', () => {
-    state.finalTermination = true;
-    cleanup(false);
-    clearCredentials();
-    renderEnded('Sessione terminata dall’altro dispositivo');
-  });
-
-  window.addEventListener('online', () => {
-    if (!socket.connected) socket.connect();
-    if (state.reconnecting && state.role === 'parent') performParentReconnect();
-    else if (state.sessionId && state.role === 'parent') requestRetry();
-  });
-  window.addEventListener('offline', () => setBadge('Offline', 'danger'));
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      if (state.role === 'baby' && state.localStream) requestWakeLock();
-      if (state.reconnecting && state.role === 'parent') performParentReconnect();
-      else if (state.sessionId && !state.connected && state.role === 'parent') requestRetry();
-    }
-  });
-  setInterval(() => {
-    if (state.sessionId && state.token && socket.connected) socket.emit('heartbeat', authPayload(), () => {});
-  }, 20_000);
-
-  async function init() {
-    try {
-      const response = await fetch('/api/config', { cache: 'no-store' });
-      const config = await response.json();
-      if (Array.isArray(config.iceServers) && config.iceServers.length) state.iceServers = config.iceServers;
-      if (Number(config.maxParents)) state.maxParents = Number(config.maxParents);
-    } catch (_error) { /* default STUN remains available */ }
-
-    const params = new URLSearchParams(location.search);
-    const isQr = params.get('role') === 'parent' && params.get('session') && params.get('qr');
-    if (isQr) {
-      clearCredentials();
-      state.role = 'parent';
-      state.pendingQr = { sessionId: params.get('session'), token: params.get('qr') };
-      renderConnecting('Associazione QR in corso…');
-      if (socket.connected) pairWithQr(state.pendingQr);
-    } else if (loadCredentials()) {
-      if (state.role === 'baby') renderBabyPermission(true);
-      else {
-        renderConnecting('Ripristino sessione…');
-        if (socket.connected) resumeSession();
-      }
-    } else {
-      renderHome();
-    }
-
-    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js?v=1.1.2').catch(() => {});
+socket.on('connect', () => {
+  if (state.role === 'parent' && state.parentToken && !state.joining && !state.parentPc && Date.now() < state.reconnectUntil) attemptReconnect();
+});
+socket.on('disconnect', () => {
+  if (state.role === 'parent') {
+    state.reconnectUntil = Date.now() + 30_000;
+    saveParentCredentials();
+    setHeaderStatus('Offline', 'error');
+    $('connectionOverlay').classList.remove('hidden');
+    $('connectionOverlay').querySelector('strong').textContent = 'Connessione persa';
+    $('connectionOverlay').querySelector('small').textContent = 'Tentativo automatico entro 30 secondi';
   }
+});
+socket.on('parent-connected', ({ parentId }) => { if (state.role === 'baby') createBabyPeer(parentId).catch(console.error); });
+socket.on('parent-paused', ({ parentId }) => closeBabyPeer(parentId));
+socket.on('parent-disconnected', ({ parentId }) => closeBabyPeer(parentId));
+socket.on('webrtc-signal', (payload) => {
+  if (state.role === 'baby') handleBabySignal(payload).catch(console.error);
+  if (state.role === 'parent') handleParentSignal(payload).catch(console.error);
+});
+socket.on('session-status', (status) => updateParentCapacity(status));
+socket.on('pairing-consumed', ({ inviteId }) => {
+  if (state.currentInvite?.inviteId === inviteId) {
+    state.currentInvite = null;
+    if ($('inviteDialog').open) $('inviteDialog').close();
+    showToast('Nuovo Parent collegato. Invito consumato.');
+  }
+});
+socket.on('set-baby-microphone', ({ enabled }) => {
+  if (state.role !== 'baby') return;
+  state.localStream?.getAudioTracks().forEach((track) => { track.enabled = enabled; });
+  state.parents.micEnabled = enabled;
+  $('babyMicBadge').textContent = enabled ? '🎙️ Microfono attivo' : '🔇 Microfono spento';
+  applyDetectionSettings(state.detection);
+});
+socket.on('baby-microphone-state', ({ enabled }) => {
+  state.parents.micEnabled = enabled;
+  $('babyMicSwitch').checked = enabled;
+});
+socket.on('detection-settings', (settings) => applyDetectionSettings(settings));
+socket.on('detection-event', (event) => { if (state.role === 'parent') addDetectionEvent(event); });
+socket.on('environment-status', (environment) => {
+  state.environment = environment;
+  applyNightMode();
+});
+socket.on('session-ended', () => {
+  clearParentCredentials(); cleanupAll(); alert('La sessione BabyMoon è terminata.'); location.href = '/';
+});
+socket.on('baby-offline', () => {
+  if (state.role !== 'parent') return;
+  setHeaderStatus('Baby offline', 'error');
+  $('connectionOverlay').classList.remove('hidden');
+  $('connectionOverlay').querySelector('strong').textContent = 'Baby Monitor offline';
+  $('connectionOverlay').querySelector('small').textContent = 'Il dispositivo Baby non è raggiungibile.';
+});
 
-  init();
+$('startBabyButton').addEventListener('click', () => showScreen('permissionsScreen'));
+$('startParentButton').addEventListener('click', () => showScreen('joinScreen'));
+$('backButton').addEventListener('click', () => showScreen('homeScreen'));
+$('grantMediaButton').addEventListener('click', startBaby);
+$('babyInviteButton').addEventListener('click', () => openInviteDialog(Boolean(state.currentInvite)));
+$('parentInviteButton').addEventListener('click', () => { $('settingsDialog').close(); openInviteDialog(false); });
+$('revokeInviteButton').addEventListener('click', revokeCurrentInvite);
+$('shareInviteButton').addEventListener('click', shareCurrentInvite);
+$('switchCameraButton').addEventListener('click', switchCamera);
+$('darkScreenButton').addEventListener('click', () => $('wakeDarkScreen').classList.remove('hidden'));
+$('wakeDarkScreen').addEventListener('click', () => $('wakeDarkScreen').classList.add('hidden'));
+$('endSessionButton').addEventListener('click', endBabySession);
+$('openScannerButton').addEventListener('click', openScanner);
+$('qrImageInput').addEventListener('change', (event) => scanQrImage(event.target.files[0]));
+$('pinInput').addEventListener('input', (event) => {
+  const digits = event.target.value.replace(/\D/g, '').slice(0, 6);
+  event.target.value = digits.length > 3 ? `${digits.slice(0, 3)} ${digits.slice(3)}` : digits;
+});
+$('pinForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const pin = $('pinInput').value.replace(/\D/g, '');
+  if (pin.length !== 6) return showInlineError('joinError', new Error('Inserisci tutte le 6 cifre del PIN.'));
+  joinSession({ pin });
+});
+$('openSettingsButton').addEventListener('click', () => { $('settingsDialog').showModal(); refreshDiagnostics(); });
+$('listenToggle').addEventListener('click', () => setListening(!state.listening));
+$('listenSwitch').addEventListener('change', (event) => setListening(event.target.checked));
+$('adaptiveSwitch').addEventListener('change', (event) => setAdaptiveVolume(event.target.checked));
+$('babyMicSwitch').addEventListener('change', (event) => setBabyMicrophone(event.target.checked));
+$('nightModeButton').addEventListener('click', cycleNightMode);
+$('nightModeSelect').addEventListener('change', (event) => { state.nightMode = event.target.value; localStorage.setItem('babymoon-night-mode', state.nightMode); applyNightMode(); });
+$('fullscreenButton').addEventListener('click', () => $('parentVideoFrame').requestFullscreen?.().catch(() => {}));
+$('pauseParentButton').addEventListener('click', pauseParent);
+$('reconnectButton').addEventListener('click', attemptReconnect);
+$('audioUnlockButton').addEventListener('click', async () => {
+  try { await $('remoteAudio').play(); $('audioUnlockButton').classList.add('hidden'); if (state.adaptiveVolume) startAdaptiveVolume(); } catch { showToast('Controlla volume e modalità silenziosa del dispositivo.'); }
+});
+$('crySwitch').addEventListener('change', saveDetectionSettings);
+$('motionSwitch').addEventListener('change', saveDetectionSettings);
+$('sensitivitySelect').addEventListener('change', saveDetectionSettings);
+$('clearEventsButton').addEventListener('click', () => { state.eventLog = []; renderTimeline(); });
+$('refreshDiagnosticsButton').addEventListener('click', refreshDiagnostics);
+$('installButton').addEventListener('click', installPwa);
+$('dismissInstallButton').addEventListener('click', () => {
+  state.installDismissed = Date.now();
+  localStorage.setItem('babymoon-install-dismissed', String(state.installDismissed));
+  refreshInstallBanner();
+});
+
+document.querySelectorAll('[data-close-dialog]').forEach((button) => button.addEventListener('click', () => {
+  const dialog = $(button.dataset.closeDialog);
+  if (dialog.id === 'scannerDialog') closeScanner(); else dialog.close();
+}));
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && state.role === 'baby' && !state.wakeLock) requestWakeLock();
+});
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  state.deferredInstallPrompt = event;
+  refreshInstallBanner();
+});
+window.addEventListener('appinstalled', () => {
+  state.deferredInstallPrompt = null;
+  $('installBanner').classList.add('hidden');
+  showToast('BabyMoon installata.');
+});
+window.matchMedia('(display-mode: standalone)').addEventListener?.('change', refreshInstallBanner);
+window.addEventListener('beforeunload', () => {
+  if (state.role === 'parent' && state.parentToken) {
+    state.reconnectUntil = Date.now() + 30_000;
+    saveParentCredentials();
+  }
+  cleanupAll();
+});
+
+(async function boot() {
+  await registerServiceWorker();
+  applyNightMode();
+  const params = new URLSearchParams(location.search);
+  const invite = parseInvite(params.get('invite'));
+  if (invite) {
+    showScreen('joinScreen');
+    joinSession({ invite });
+    return;
+  }
+  const saved = JSON.parse(localStorage.getItem('babymoon-parent-session') || 'null');
+  if (saved?.parentToken && saved.reconnectUntil > Date.now()) {
+    Object.assign(state, saved, { role: 'parent' });
+    showScreen('parentScreen');
+    initializeParentUi();
+    state.reconnectUntil = saved.reconnectUntil;
+    attemptReconnect();
+    return;
+  }
+  const requestedMode = params.get('mode');
+  showScreen(requestedMode === 'parent' ? 'joinScreen' : requestedMode === 'baby' ? 'permissionsScreen' : 'homeScreen');
+  setTimeout(refreshInstallBanner, 1200);
 })();
