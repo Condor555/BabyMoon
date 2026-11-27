@@ -1,505 +1,466 @@
 'use strict';
 
 const crypto = require('node:crypto');
-const http = require('node:http');
 const path = require('node:path');
+const http = require('node:http');
 const express = require('express');
-const { Server } = require('socket.io');
+const helmet = require('helmet');
 const QRCode = require('qrcode');
+const { Server } = require('socket.io');
+const { parentTarget, babyTargetForParent, detachParentSocket } = require('./lib/peer-routing');
 
 const PORT = Number(process.env.PORT || 3000);
-const VERSION = '1.2.0';
 const MAX_PARENTS = 3;
-const INVITE_TTL_MS = 5 * 60 * 1000;
-const RECONNECT_TTL_MS = 30 * 1000;
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const INVITE_TTL_MS = 5 * 60_000;
+const RECONNECT_TTL_MS = 30_000;
+const SESSION_TTL_MS = 12 * 60 * 60_000;
+const secret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const production = process.env.NODE_ENV === 'production';
 
-const randomToken = (bytes = 24) => crypto.randomBytes(bytes).toString('base64url');
-const safeEqual = (left = '', right = '') => {
-  const a = Buffer.from(String(left));
-  const b = Buffer.from(String(right));
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-};
-const normalizePin = (pin = '') => String(pin).replace(/\D/g, '').slice(0, 6);
-const publicOrigin = (socket) => {
-  const configured = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
-  if (configured) return configured;
-  const forwarded = socket.handshake.headers['x-forwarded-proto'];
-  const protocol = forwarded || (socket.handshake.secure ? 'https' : 'http');
-  return `${protocol}://${socket.handshake.headers.host}`;
-};
-
-class SlidingWindowLimiter {
-  constructor(limit, windowMs) {
-    this.limit = limit;
-    this.windowMs = windowMs;
-    this.hits = new Map();
-  }
-
-  take(key, now = Date.now()) {
-    const recent = (this.hits.get(key) || []).filter((time) => now - time < this.windowMs);
-    if (recent.length >= this.limit) {
-      this.hits.set(key, recent);
-      return false;
+const app = express();
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      mediaSrc: ["'self'", 'blob:'],
+      connectSrc: ["'self'", 'wss:', 'ws:'],
+      workerSrc: ["'self'", 'blob:'],
+      manifestSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"]
     }
-    recent.push(now);
-    this.hits.set(key, recent);
-    return true;
+  },
+  crossOriginEmbedderPolicy: false
+}));
+app.use((req, res, next) => {
+  if (production && req.headers['x-forwarded-proto'] && req.headers['x-forwarded-proto'] !== 'https') {
+    return res.redirect(308, `https://${req.headers.host}${req.originalUrl}`);
   }
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), fullscreen=(self), display-capture=()');
+  next();
+});
+app.use(express.json({ limit: '16kb' }));
 
-  clearExpired(now = Date.now()) {
-    for (const [key, hits] of this.hits) {
-      const recent = hits.filter((time) => now - time < this.windowMs);
-      if (recent.length) this.hits.set(key, recent);
-      else this.hits.delete(key);
-    }
-  }
+const server = http.createServer(app);
+const io = new Server(server, {
+  maxHttpBufferSize: 64 * 1024,
+  transports: ['websocket', 'polling'],
+  pingInterval: 10_000,
+  pingTimeout: 20_000
+});
+
+/** @type {Map<string, any>} */
+const sessions = new Map();
+const pinAttempts = new Map();
+
+const randomId = (bytes = 18) => crypto.randomBytes(bytes).toString('base64url');
+const digest = (value) => crypto.createHmac('sha256', secret).update(String(value)).digest('hex');
+const timingSafeHashEqual = (value, expectedHash) => {
+  const actual = Buffer.from(digest(value));
+  const expected = Buffer.from(String(expectedHash || ''));
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+};
+const sanitizeId = (value, max = 128) => typeof value === 'string' && value.length > 0 && value.length <= max ? value : null;
+const callback = (ack, payload) => typeof ack === 'function' && ack(payload);
+const roomName = (sessionId) => `session:${sessionId}`;
+const now = () => Date.now();
+
+function publicBase(socket) {
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/$/, '');
+  const origin = socket.handshake.headers.origin;
+  if (origin && /^https?:\/\//i.test(origin)) return origin.replace(/\/$/, '');
+  const proto = socket.handshake.headers['x-forwarded-proto'] || (production ? 'https' : 'http');
+  const host = socket.handshake.headers['x-forwarded-host'] || socket.handshake.headers.host || `localhost:${PORT}`;
+  return `${proto}://${host}`;
 }
 
-class SessionRegistry {
-  constructor(now = () => Date.now()) {
-    this.now = now;
-    this.sessions = new Map();
-    this.invitesById = new Map();
-    this.invitesByPin = new Map();
+function getIceServers() {
+  const urls = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302')
+    .split(',').map((v) => v.trim()).filter(Boolean);
+  const servers = urls.length ? [{ urls }] : [];
+  const turnUrls = (process.env.TURN_URLS || '').split(',').map((v) => v.trim()).filter(Boolean);
+  if (turnUrls.length && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    servers.push({ urls: turnUrls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
   }
-
-  createSession(babySocketId) {
-    const id = crypto.randomUUID();
-    const session = {
-      id,
-      babySocketId,
-      babyToken: randomToken(),
-      createdAt: this.now(),
-      expiresAt: this.now() + SESSION_TTL_MS,
-      parents: new Map(),
-      activeInviteIds: new Set(),
-      micEnabled: true,
-      detection: { cry: true, motion: true, sensitivity: 'medium', cooldown: 20 },
-      environment: { luminance: null, lowLight: false },
-      ended: false
-    };
-    this.sessions.set(id, session);
-    return session;
-  }
-
-  getSession(id) {
-    const session = this.sessions.get(id);
-    if (!session || session.ended || session.expiresAt <= this.now()) return null;
-    return session;
-  }
-
-  parentCount(session) {
-    return [...session.parents.values()].filter((parent) => parent.reconnectUntil > this.now() || parent.socketId).length;
-  }
-
-  slots(session) {
-    return Math.max(0, MAX_PARENTS - this.parentCount(session));
-  }
-
-  authenticateBaby(session, token, socketId) {
-    return Boolean(session && session.babySocketId === socketId && safeEqual(session.babyToken, token));
-  }
-
-  authenticateParent(session, parentId, token, socketId) {
-    const parent = session?.parents.get(parentId);
-    return Boolean(parent && parent.socketId === socketId && safeEqual(parent.token, token));
-  }
-
-  createInvite(session, creator) {
-    if (this.slots(session) <= 0) throw new Error('PARENT_LIMIT');
-    const id = crypto.randomUUID();
-    let pin;
-    do pin = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
-    while (this.invitesByPin.has(pin));
-
-    const invite = {
-      id,
-      secret: randomToken(18),
-      pin,
-      sessionId: session.id,
-      createdAt: this.now(),
-      expiresAt: this.now() + INVITE_TTL_MS,
-      createdByRole: creator.role,
-      createdById: creator.id,
-      consumedAt: null,
-      revokedAt: null
-    };
-    this.invitesById.set(id, invite);
-    this.invitesByPin.set(pin, id);
-    session.activeInviteIds.add(id);
-    return invite;
-  }
-
-  consumeInvite({ pin, inviteKey }) {
-    let invite;
-    if (inviteKey) {
-      const [id, secret] = String(inviteKey).split('.');
-      invite = this.invitesById.get(id);
-      if (!invite || !safeEqual(invite.secret, secret)) throw new Error('INVALID_INVITE');
-    } else {
-      const id = this.invitesByPin.get(normalizePin(pin));
-      invite = id ? this.invitesById.get(id) : null;
-    }
-    if (!invite) throw new Error('INVALID_INVITE');
-    if (invite.revokedAt) throw new Error('REVOKED_INVITE');
-    if (invite.consumedAt) throw new Error('CONSUMED_INVITE');
-    if (invite.expiresAt <= this.now()) throw new Error('EXPIRED_INVITE');
-
-    const session = this.getSession(invite.sessionId);
-    if (!session) throw new Error('SESSION_ENDED');
-    if (this.slots(session) <= 0) throw new Error('PARENT_LIMIT');
-
-    invite.consumedAt = this.now();
-    session.activeInviteIds.delete(invite.id);
-    this.invitesByPin.delete(invite.pin);
-    return { invite, session };
-  }
-
-  revokeInvite(session, inviteId) {
-    const invite = this.invitesById.get(inviteId);
-    if (!invite || invite.sessionId !== session.id || invite.consumedAt || invite.revokedAt) return false;
-    invite.revokedAt = this.now();
-    session.activeInviteIds.delete(invite.id);
-    this.invitesByPin.delete(invite.pin);
-    return true;
-  }
-
-  addParent(session, socketId) {
-    if (this.slots(session) <= 0) throw new Error('PARENT_LIMIT');
-    const parent = {
-      id: crypto.randomUUID(),
-      token: randomToken(),
-      socketId,
-      joinedAt: this.now(),
-      reconnectUntil: this.now() + RECONNECT_TTL_MS,
-      listening: true,
-      adaptiveVolume: true
-    };
-    session.parents.set(parent.id, parent);
-    return parent;
-  }
-
-  reconnect(session, parentId, token, socketId) {
-    const parent = session?.parents.get(parentId);
-    if (!parent || !safeEqual(parent.token, token) || parent.reconnectUntil <= this.now()) return null;
-    parent.socketId = socketId;
-    parent.reconnectUntil = this.now() + RECONNECT_TTL_MS;
-    return parent;
-  }
-
-  disconnectParent(session, parentId) {
-    const parent = session?.parents.get(parentId);
-    if (!parent) return;
-    parent.socketId = null;
-    parent.reconnectUntil = this.now() + RECONNECT_TTL_MS;
-  }
-
-  removeExpired() {
-    const now = this.now();
-    const changedSessions = new Set();
-    for (const invite of this.invitesById.values()) {
-      if (invite.expiresAt <= now && !invite.consumedAt && !invite.revokedAt) {
-        this.invitesByPin.delete(invite.pin);
-        this.sessions.get(invite.sessionId)?.activeInviteIds.delete(invite.id);
-      }
-    }
-    for (const [id, session] of this.sessions) {
-      for (const [parentId, parent] of session.parents) {
-        if (!parent.socketId && parent.reconnectUntil <= now) {
-          session.parents.delete(parentId);
-          changedSessions.add(session.id);
-        }
-      }
-      if (session.ended || session.expiresAt <= now) this.sessions.delete(id);
-    }
-    return changedSessions;
-  }
+  return servers;
 }
 
-function createApplication() {
-  const app = express();
-  const server = http.createServer(app);
-  const io = new Server(server, {
-    transports: ['websocket', 'polling'],
-    pingTimeout: 20_000,
-    maxHttpBufferSize: 150_000
-  });
-  const registry = new SessionRegistry();
-  const sessionLimiter = new SlidingWindowLimiter(5, 60_000);
-  const inviteLimiter = new SlidingWindowLimiter(4, 60_000);
-  const joinLimiter = new SlidingWindowLimiter(12, 60_000);
-
-  app.disable('x-powered-by');
-  app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), fullscreen=(self), display-capture=()');
-    if (process.env.NODE_ENV === 'production') {
-      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    }
-    next();
-  });
-  app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'BabyMoon', version: VERSION }));
-  app.get('/api/qr', async (req, res) => {
-    const data = String(req.query.data || '');
-    if (!data || data.length > 1000) return res.status(400).end();
-    try {
-      const png = await QRCode.toBuffer(data, { type: 'png', width: 560, margin: 2, errorCorrectionLevel: 'M' });
-      res.type('png').set('Cache-Control', 'no-store').send(png);
-    } catch {
-      res.status(400).end();
-    }
-  });
-  app.get('/vendor/jsQR.js', (_req, res) => {
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    res.sendFile(path.join(__dirname, 'node_modules/jsqr/dist/jsQR.js'));
-  });
-  app.use(express.static(path.join(__dirname, 'public'), {
-    etag: true,
-    setHeaders(res, filePath) {
-      if (filePath.endsWith('sw.js') || filePath.endsWith('manifest.webmanifest')) {
-        res.setHeader('Cache-Control', 'no-cache');
-      }
-    }
-  }));
-  app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public/index.html')));
-
-  const ackError = (ack, code) => typeof ack === 'function' && ack({ ok: false, code });
-  const statusPayload = (session) => ({
-    connected: registry.parentCount(session),
-    max: MAX_PARENTS,
-    available: registry.slots(session),
-    micEnabled: session.micEnabled
-  });
-  const broadcastStatus = (session) => io.to(`session:${session.id}`).emit('session-status', statusPayload(session));
-  const invitePayload = (invite, socket) => {
-    const inviteKey = `${invite.id}.${invite.secret}`;
-    const joinUrl = `${publicOrigin(socket)}/?mode=parent&invite=${encodeURIComponent(inviteKey)}`;
-    return {
-      inviteId: invite.id,
-      pin: invite.pin,
-      joinUrl,
-      expiresAt: invite.expiresAt,
-      qrUrl: `/api/qr?data=${encodeURIComponent(joinUrl)}`
-    };
+function sessionSummary(session) {
+  return {
+    sessionId: session.id,
+    parentCount: [...session.parents.values()].filter((p) => p.socketId).length,
+    reservedParentCount: session.parents.size,
+    maxParents: MAX_PARENTS,
+    babyMicEnabled: session.babyMicEnabled,
+    babyOnline: Boolean(session.baby.socketId)
   };
+}
 
-  io.on('connection', (socket) => {
-    const forwardedFor = String(socket.handshake.headers['x-forwarded-for'] || '').split(',')[0].trim();
-    const ipKey = forwardedFor || socket.handshake.address || 'unknown';
+function emitPresence(session) {
+  io.to(roomName(session.id)).emit('session:presence', sessionSummary(session));
+}
 
-    socket.on('create-session', (_payload, ack) => {
-      if (!sessionLimiter.take(`session:${ipKey}`)) return ackError(ack, 'RATE_LIMIT');
-      const session = registry.createSession(socket.id);
-      socket.data = { role: 'baby', sessionId: session.id };
-      socket.join(`session:${session.id}`);
-      const invite = registry.createInvite(session, { role: 'baby', id: socket.id });
-      ack?.({
-        ok: true,
-        sessionId: session.id,
-        babyToken: session.babyToken,
-        invite: invitePayload(invite, socket),
-        status: statusPayload(session),
-        detection: session.detection
-      });
+function clearParentTimer(parent) {
+  if (parent.cleanupTimer) clearTimeout(parent.cleanupTimer);
+  parent.cleanupTimer = null;
+}
+
+function deleteParent(session, parentId, reason = 'expired') {
+  const parent = session.parents.get(parentId);
+  if (!parent) return;
+  clearParentTimer(parent);
+  if (parent.socketId) {
+    const socket = io.sockets.sockets.get(parent.socketId);
+    if (socket) {
+      socket.leave(roomName(session.id));
+      socket.data = { role: 'detached' };
+      socket.emit('parent:ended', { reason });
+    }
+  }
+  session.parents.delete(parentId);
+  if (session.baby.socketId) io.to(session.baby.socketId).emit('parent:left', { parentId, reason, reconnectable: false });
+  emitPresence(session);
+}
+
+function scheduleParentExpiry(session, parent, reason) {
+  clearParentTimer(parent);
+  parent.reconnectUntil = now() + RECONNECT_TTL_MS;
+  parent.cleanupTimer = setTimeout(() => deleteParent(session, parent.id, 'reconnect-expired'), RECONNECT_TTL_MS + 250);
+  if (session.baby.socketId) {
+    io.to(session.baby.socketId).emit('parent:left', {
+      parentId: parent.id,
+      reason,
+      reconnectable: true,
+      reconnectUntil: parent.reconnectUntil
     });
+  }
+  emitPresence(session);
+}
 
-    socket.on('create-pairing', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      const isBaby = registry.authenticateBaby(session, payload.token, socket.id);
-      const isParent = registry.authenticateParent(session, payload.parentId, payload.token, socket.id);
-      if (!isBaby && !isParent) return ackError(ack, 'UNAUTHORIZED');
-      const creatorKey = isBaby ? 'baby' : `parent:${payload.parentId}`;
-      if (!inviteLimiter.take(`${session.id}:${creatorKey}`)) return ackError(ack, 'RATE_LIMIT');
-      try {
-        const invite = registry.createInvite(session, {
-          role: isBaby ? 'baby' : 'parent',
-          id: isBaby ? socket.id : payload.parentId
-        });
-        ack?.({ ok: true, invite: invitePayload(invite, socket), status: statusPayload(session) });
-      } catch (error) {
-        ackError(ack, error.message);
-      }
-    });
+function endSession(session, reason = 'ended') {
+  if (!session || session.ended) return;
+  session.ended = true;
+  if (session.expiryTimer) clearTimeout(session.expiryTimer);
+  if (session.babyOfflineTimer) clearTimeout(session.babyOfflineTimer);
+  for (const parent of session.parents.values()) clearParentTimer(parent);
+  io.to(roomName(session.id)).emit('session:ended', { reason });
+  for (const socket of io.sockets.sockets.values()) {
+    if (socket.data.sessionId === session.id) {
+      socket.leave(roomName(session.id));
+      socket.data = { role: 'detached' };
+    }
+  }
+  sessions.delete(session.id);
+}
 
-    socket.on('revoke-pairing', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      const authorized = registry.authenticateBaby(session, payload.token, socket.id)
-        || registry.authenticateParent(session, payload.parentId, payload.token, socket.id);
-      if (!authorized) return ackError(ack, 'UNAUTHORIZED');
-      const revoked = registry.revokeInvite(session, payload.inviteId);
-      ack?.({ ok: revoked });
-    });
+async function makeInvite(session, socket) {
+  if (session.parents.size >= MAX_PARENTS) throw new Error('Limite di 3 Parent raggiunto');
+  const inviteToken = randomId(24);
+  let pin;
+  do pin = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+  while ([...sessions.values()].some((s) => [...s.invites.values()].some((i) => !i.used && i.expiresAt > now() && timingSafeHashEqual(pin, i.pinHash))));
+  const inviteId = randomId(12);
+  const expiresAt = now() + INVITE_TTL_MS;
+  session.invites.set(inviteId, {
+    id: inviteId,
+    tokenHash: digest(inviteToken),
+    pinHash: digest(pin),
+    expiresAt,
+    used: false,
+    createdBy: socket.data.role,
+    createdAt: now()
+  });
+  const url = `${publicBase(socket)}/?mode=parent&invite=${encodeURIComponent(inviteToken)}`;
+  const qrDataUrl = await QRCode.toDataURL(url, { width: 360, margin: 1, errorCorrectionLevel: 'M' });
+  return { inviteId, pin, inviteToken, expiresAt, url, qrDataUrl };
+}
 
-    socket.on('join-session', (payload = {}, ack) => {
-      if (!joinLimiter.take(`join:${ipKey}`)) return ackError(ack, 'RATE_LIMIT');
-      try {
-        const { session, invite } = registry.consumeInvite({ pin: payload.pin, inviteKey: payload.invite });
-        const parent = registry.addParent(session, socket.id);
-        socket.data = { role: 'parent', sessionId: session.id, parentId: parent.id };
-        socket.join(`session:${session.id}`);
-        ack?.({
-          ok: true,
-          sessionId: session.id,
-          parentId: parent.id,
-          parentToken: parent.token,
-          reconnectUntil: parent.reconnectUntil,
-          status: statusPayload(session),
-          detection: session.detection,
-          environment: session.environment
-        });
-        io.to(`session:${session.id}`).emit('pairing-consumed', { inviteId: invite.id });
-        io.to(session.babySocketId).emit('parent-connected', { parentId: parent.id });
-        broadcastStatus(session);
-      } catch (error) {
-        ackError(ack, error.message);
-      }
-    });
+function findInvite({ inviteToken, pin }) {
+  const value = sanitizeId(inviteToken, 256) || (typeof pin === 'string' && /^\d{6}$/.test(pin) ? pin : null);
+  if (!value) return null;
+  for (const session of sessions.values()) {
+    for (const invite of session.invites.values()) {
+      if (invite.used || invite.expiresAt <= now()) continue;
+      const match = inviteToken ? timingSafeHashEqual(value, invite.tokenHash) : timingSafeHashEqual(value, invite.pinHash);
+      if (match) return { session, invite };
+    }
+  }
+  return null;
+}
 
-    socket.on('reconnect-session', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      const parent = registry.reconnect(session, payload.parentId, payload.parentToken, socket.id);
-      if (!parent) return ackError(ack, 'RECONNECT_EXPIRED');
-      socket.data = { role: 'parent', sessionId: session.id, parentId: parent.id };
-      socket.join(`session:${session.id}`);
-      ack?.({ ok: true, reconnectUntil: parent.reconnectUntil, status: statusPayload(session), detection: session.detection, environment: session.environment });
-      io.to(session.babySocketId).emit('parent-connected', { parentId: parent.id, reconnected: true });
-      broadcastStatus(session);
-    });
+function rateLimitPair(socket) {
+  const key = socket.handshake.address || socket.id;
+  const entry = pinAttempts.get(key) || { count: 0, resetAt: now() + 60_000 };
+  if (entry.resetAt <= now()) { entry.count = 0; entry.resetAt = now() + 60_000; }
+  entry.count += 1;
+  pinAttempts.set(key, entry);
+  return entry.count <= 5;
+}
 
-    socket.on('parent-pause', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      if (!registry.authenticateParent(session, payload.parentId, payload.parentToken, socket.id)) return ackError(ack, 'UNAUTHORIZED');
-      const parent = session.parents.get(payload.parentId);
-      parent.reconnectUntil = Date.now() + RECONNECT_TTL_MS;
-      io.to(session.babySocketId).emit('parent-paused', { parentId: parent.id });
-      ack?.({ ok: true, reconnectUntil: parent.reconnectUntil });
-    });
+function authenticatedSession(socket) {
+  const session = sessions.get(socket.data.sessionId);
+  return session && !session.ended ? session : null;
+}
 
-    socket.on('webrtc-signal', (payload = {}) => {
-      const session = registry.getSession(socket.data?.sessionId);
-      if (!session || payload.sessionId !== session.id) return;
-      if (socket.data.role === 'baby' && registry.authenticateBaby(session, payload.token, socket.id)) {
-        const parent = session.parents.get(payload.parentId);
-        if (parent?.socketId) io.to(parent.socketId).emit('webrtc-signal', { ...payload, from: 'baby' });
-      } else if (socket.data.role === 'parent' && registry.authenticateParent(session, socket.data.parentId, payload.token, socket.id)) {
-        io.to(session.babySocketId).emit('webrtc-signal', { ...payload, parentId: socket.data.parentId, from: 'parent' });
-      }
-    });
+function authenticatedParent(socket, session) {
+  if (!session || socket.data.role !== 'parent') return null;
+  const parent = session.parents.get(socket.data.parentId);
+  return parent && parent.socketId === socket.id ? parent : null;
+}
 
-    socket.on('set-baby-microphone', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      if (!registry.authenticateParent(session, payload.parentId, payload.parentToken, socket.id)) return ackError(ack, 'UNAUTHORIZED');
-      session.micEnabled = Boolean(payload.enabled);
-      io.to(session.babySocketId).emit('set-baby-microphone', { enabled: session.micEnabled });
-      io.to(`session:${session.id}`).emit('baby-microphone-state', { enabled: session.micEnabled });
-      ack?.({ ok: true, enabled: session.micEnabled });
-    });
+function attachBabySocket(socket, session) {
+  if (session.baby.socketId && session.baby.socketId !== socket.id) io.to(session.baby.socketId).emit('device:replaced');
+  session.baby.socketId = socket.id;
+  if (session.babyOfflineTimer) clearTimeout(session.babyOfflineTimer);
+  session.babyOfflineTimer = null;
+  socket.data = { role: 'baby', sessionId: session.id };
+  socket.join(roomName(session.id));
+}
 
-    socket.on('set-detection', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      if (!registry.authenticateParent(session, payload.parentId, payload.parentToken, socket.id)) return ackError(ack, 'UNAUTHORIZED');
-      session.detection = {
-        cry: payload.cry !== false,
-        motion: payload.motion !== false,
-        sensitivity: ['low', 'medium', 'high'].includes(payload.sensitivity) ? payload.sensitivity : 'medium',
-        cooldown: Math.max(10, Math.min(120, Number(payload.cooldown) || 20))
+function attachParentSocket(socket, session, parent) {
+  clearParentTimer(parent);
+  if (parent.socketId && parent.socketId !== socket.id) io.to(parent.socketId).emit('device:replaced');
+  parent.socketId = socket.id;
+  parent.reconnectUntil = null;
+  socket.data = { role: 'parent', sessionId: session.id, parentId: parent.id };
+  socket.join(roomName(session.id));
+}
+
+app.get('/api/health', (_req, res) => res.json({ ok: true, app: 'BabyMoon', version: '1.2.1' }));
+app.get('/api/config', (_req, res) => res.json({ iceServers: getIceServers(), maxParents: MAX_PARENTS, reconnectSeconds: 30 }));
+app.get('/vendor/jsqr.js', (_req, res) => res.sendFile(require.resolve('jsqr')));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: production ? '1h' : 0, etag: true }));
+app.get('/*splat', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+io.on('connection', (socket) => {
+  socket.data = { role: 'guest' };
+
+  socket.on('baby:create', async (_payload, ack) => {
+    try {
+      const id = randomId(12);
+      const babyToken = randomId(32);
+      const session = {
+        id,
+        baby: { socketId: null, tokenHash: digest(babyToken) },
+        parents: new Map(),
+        invites: new Map(),
+        babyMicEnabled: true,
+        createdAt: now(),
+        ended: false,
+        expiryTimer: null,
+        babyOfflineTimer: null
       };
-      io.to(`session:${session.id}`).emit('detection-settings', session.detection);
-      ack?.({ ok: true, detection: session.detection });
-    });
-
-    socket.on('detection-event', (payload = {}) => {
-      const session = registry.getSession(payload.sessionId);
-      if (!registry.authenticateBaby(session, payload.token, socket.id)) return;
-      const allowed = ['cry', 'motion'];
-      if (!allowed.includes(payload.type)) return;
-      io.to(`session:${session.id}`).emit('detection-event', {
-        id: crypto.randomUUID(), type: payload.type, confidence: Math.max(0, Math.min(1, Number(payload.confidence) || 0)), at: Date.now()
-      });
-    });
-
-    socket.on('environment-status', (payload = {}) => {
-      const session = registry.getSession(payload.sessionId);
-      if (!registry.authenticateBaby(session, payload.token, socket.id)) return;
-      const luminance = Math.max(0, Math.min(255, Number(payload.luminance) || 0));
-      session.environment = { luminance, lowLight: luminance < 52 };
-      socket.to(`session:${session.id}`).emit('environment-status', session.environment);
-    });
-
-    socket.on('end-session', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      if (!registry.authenticateBaby(session, payload.babyToken, socket.id)) return ackError(ack, 'UNAUTHORIZED');
-      session.ended = true;
-      io.to(`session:${session.id}`).emit('session-ended');
-      for (const inviteId of session.activeInviteIds) registry.revokeInvite(session, inviteId);
-      ack?.({ ok: true });
-    });
-
-    socket.on('diagnostics-request', (payload = {}, ack) => {
-      const session = registry.getSession(payload.sessionId);
-      const authorized = registry.authenticateBaby(session, payload.token, socket.id)
-        || registry.authenticateParent(session, payload.parentId, payload.token, socket.id);
-      if (!authorized) return ackError(ack, 'UNAUTHORIZED');
-      const liveInvites = [...session.activeInviteIds]
-        .map((id) => registry.invitesById.get(id))
-        .filter((invite) => invite && !invite.revokedAt && !invite.consumedAt && invite.expiresAt > Date.now());
-      ack?.({
-        ok: true,
-        version: VERSION,
-        sessionAgeMs: Date.now() - session.createdAt,
-        parentCount: registry.parentCount(session),
-        maxParents: MAX_PARENTS,
-        availableSlots: registry.slots(session),
-        activePairings: liveInvites.length,
-        micEnabled: session.micEnabled,
-        detection: session.detection,
-        environment: session.environment,
-        transport: socket.conn.transport.name
-      });
-    });
-
-    socket.on('disconnect', () => {
-      const session = registry.getSession(socket.data?.sessionId);
-      if (!session) return;
-      if (socket.data.role === 'baby') {
-        session.ended = true;
-        io.to(`session:${session.id}`).emit('baby-offline');
-      } else if (socket.data.role === 'parent') {
-        registry.disconnectParent(session, socket.data.parentId);
-        io.to(session.babySocketId).emit('parent-disconnected', {
-          parentId: socket.data.parentId,
-          reconnectUntil: Date.now() + RECONNECT_TTL_MS
-        });
-        broadcastStatus(session);
-      }
-    });
+      session.expiryTimer = setTimeout(() => endSession(session, 'expired'), SESSION_TTL_MS);
+      sessions.set(id, session);
+      attachBabySocket(socket, session);
+      const invite = await makeInvite(session, socket);
+      callback(ack, { ok: true, sessionId: id, babyToken, invite, iceServers: getIceServers(), summary: sessionSummary(session) });
+      emitPresence(session);
+    } catch (error) {
+      callback(ack, { ok: false, error: error.message });
+    }
   });
 
-  const cleanupTimer = setInterval(() => {
-    const changedSessions = registry.removeExpired();
-    for (const sessionId of changedSessions) {
-      const session = registry.getSession(sessionId);
-      if (session) broadcastStatus(session);
+  socket.on('baby:resume', ({ sessionId, babyToken } = {}, ack) => {
+    const session = sessions.get(sanitizeId(sessionId));
+    if (!session || !timingSafeHashEqual(babyToken, session.baby.tokenHash)) return callback(ack, { ok: false, error: 'Sessione Baby non valida' });
+    attachBabySocket(socket, session);
+    callback(ack, { ok: true, summary: sessionSummary(session), iceServers: getIceServers() });
+    for (const parent of session.parents.values()) {
+      if (parent.socketId) {
+        socket.emit('parent:ready', { parentId: parent.id, reason: 'baby-resumed' });
+        io.to(parent.socketId).emit('baby:online', { sessionId: session.id });
+      }
     }
-    sessionLimiter.clearExpired();
-    inviteLimiter.clearExpired();
-    joinLimiter.clearExpired();
-  }, 15_000);
-  cleanupTimer.unref();
+    emitPresence(session);
+  });
 
-  return { app, server, io, registry };
-}
+  socket.on('invite:create', async (_payload, ack) => {
+    const session = authenticatedSession(socket);
+    if (!session || !['baby', 'parent'].includes(socket.data.role)) return callback(ack, { ok: false, error: 'Non autorizzato' });
+    try { callback(ack, { ok: true, invite: await makeInvite(session, socket), summary: sessionSummary(session) }); }
+    catch (error) { callback(ack, { ok: false, error: error.message }); }
+  });
+
+  socket.on('invite:revoke', ({ inviteId } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const id = sanitizeId(inviteId);
+    if (!session || !id || !['baby', 'parent'].includes(socket.data.role)) return callback(ack, { ok: false, error: 'Non autorizzato' });
+    const invite = session.invites.get(id);
+    if (invite) { invite.used = true; session.invites.delete(id); }
+    callback(ack, { ok: true });
+  });
+
+  socket.on('parent:pair', ({ inviteToken, pin } = {}, ack) => {
+    if (!rateLimitPair(socket)) return callback(ack, { ok: false, error: 'Troppi tentativi. Attendi un minuto.' });
+    const found = findInvite({ inviteToken, pin });
+    if (!found) return callback(ack, { ok: false, error: 'Invito non valido o scaduto' });
+    const { session, invite } = found;
+    if (session.parents.size >= MAX_PARENTS) return callback(ack, { ok: false, error: 'Limite di 3 Parent raggiunto' });
+    invite.used = true;
+    const parentId = randomId(12);
+    const parentToken = randomId(32);
+    const parent = { id: parentId, tokenHash: digest(parentToken), socketId: null, reconnectUntil: null, cleanupTimer: null, joinedAt: now() };
+    session.parents.set(parentId, parent);
+    attachParentSocket(socket, session, parent);
+    callback(ack, { ok: true, sessionId: session.id, parentId, parentToken, iceServers: getIceServers(), summary: sessionSummary(session) });
+    if (session.baby.socketId) io.to(session.baby.socketId).emit('parent:ready', { parentId, reason: 'paired' });
+    emitPresence(session);
+  });
+
+  socket.on('parent:resume', ({ sessionId, parentId, parentToken } = {}, ack) => {
+    const session = sessions.get(sanitizeId(sessionId));
+    const parent = session?.parents.get(sanitizeId(parentId));
+    if (!session || !parent || !timingSafeHashEqual(parentToken, parent.tokenHash)) return callback(ack, { ok: false, error: 'Sessione Parent non valida' });
+    if (parent.reconnectUntil && parent.reconnectUntil < now()) {
+      deleteParent(session, parent.id, 'reconnect-expired');
+      return callback(ack, { ok: false, error: 'Finestra di riconnessione scaduta' });
+    }
+    attachParentSocket(socket, session, parent);
+    callback(ack, { ok: true, iceServers: getIceServers(), summary: sessionSummary(session) });
+    if (session.baby.socketId) io.to(session.baby.socketId).emit('parent:ready', { parentId: parent.id, reason: 'resumed' });
+    emitPresence(session);
+  });
+
+  socket.on('parent:leave', (_payload, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = authenticatedParent(socket, session);
+    if (!parent) return callback(ack, { ok: false, error: 'Parent non autorizzato' });
+    if (!detachParentSocket(session, parent.id, socket.id)) return callback(ack, { ok: false, error: 'Parent non autorizzato' });
+    socket.leave(roomName(session.id));
+    socket.data = { role: 'detached', sessionId: session.id, parentId: parent.id };
+    scheduleParentExpiry(session, parent, 'parent-hangup');
+    callback(ack, { ok: true, reconnectUntil: parent.reconnectUntil });
+  });
+
+  socket.on('parent:end', (_payload, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = authenticatedParent(socket, session);
+    if (!parent) return callback(ack, { ok: false, error: 'Parent non autorizzato' });
+    callback(ack, { ok: true });
+    deleteParent(session, parent.id, 'parent-ended');
+  });
+
+  socket.on('session:end', (_payload, ack) => {
+    const session = authenticatedSession(socket);
+    if (!session || socket.data.role !== 'baby' || session.baby.socketId !== socket.id) {
+      return callback(ack, { ok: false, error: 'Solo il Baby può terminare l’intera sessione' });
+    }
+    callback(ack, { ok: true });
+    endSession(session, 'baby-ended');
+  });
+
+  socket.on('webrtc:offer', ({ parentId, negotiationId, description } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = session?.parents.get(sanitizeId(parentId));
+    if (!session || socket.data.role !== 'baby' || !parent?.socketId || !sanitizeId(negotiationId) || description?.type !== 'offer' || typeof description.sdp !== 'string') {
+      return callback(ack, { ok: false, error: 'Offerta non autorizzata' });
+    }
+    const targetSocketId = parentTarget(session, parent.id);
+    if (!targetSocketId) return callback(ack, { ok: false, error: 'Parent offline' });
+    io.to(targetSocketId).emit('webrtc:offer', { parentId: parent.id, negotiationId, description });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('webrtc:answer', ({ parentId, negotiationId, description } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = authenticatedParent(socket, session);
+    if (!parent || parent.id !== parentId || !session.baby.socketId || !sanitizeId(negotiationId) || description?.type !== 'answer' || typeof description.sdp !== 'string') {
+      return callback(ack, { ok: false, error: 'Risposta non autorizzata' });
+    }
+    const targetSocketId = babyTargetForParent(session, parent.id, socket.id);
+    if (!targetSocketId) return callback(ack, { ok: false, error: 'Baby offline' });
+    io.to(targetSocketId).emit('webrtc:answer', { parentId: parent.id, negotiationId, description });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('webrtc:ice', ({ parentId, negotiationId, candidate } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const id = sanitizeId(parentId);
+    if (!session || !id || !sanitizeId(negotiationId)) return callback(ack, { ok: false, error: 'ICE non autorizzato' });
+    if (candidate !== null && (typeof candidate !== 'object' || typeof candidate.candidate !== 'string')) return callback(ack, { ok: false, error: 'Candidate non valido' });
+    if (socket.data.role === 'baby') {
+      const parent = session.parents.get(id);
+      if (!parent?.socketId) return callback(ack, { ok: false, error: 'Parent offline' });
+      const targetSocketId = parentTarget(session, id);
+      if (!targetSocketId) return callback(ack, { ok: false, error: 'Parent offline' });
+      io.to(targetSocketId).emit('webrtc:ice', { parentId: id, negotiationId, candidate });
+    } else {
+      const parent = authenticatedParent(socket, session);
+      if (!parent || parent.id !== id || !session.baby.socketId) return callback(ack, { ok: false, error: 'Parent non autorizzato' });
+      const targetSocketId = babyTargetForParent(session, id, socket.id);
+      if (!targetSocketId) return callback(ack, { ok: false, error: 'Baby offline' });
+      io.to(targetSocketId).emit('webrtc:ice', { parentId: id, negotiationId, candidate });
+    }
+    callback(ack, { ok: true });
+  });
+
+  socket.on('webrtc:restart', ({ parentId, reason } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = authenticatedParent(socket, session);
+    if (!parent || parent.id !== parentId || !session.baby.socketId) return callback(ack, { ok: false, error: 'Restart non autorizzato' });
+    io.to(session.baby.socketId).emit('webrtc:restart', { parentId, reason: sanitizeId(reason, 64) || 'requested' });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('talkback:state', ({ enabled } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = authenticatedParent(socket, session);
+    if (!parent || !session.baby.socketId || typeof enabled !== 'boolean') return callback(ack, { ok: false, error: 'Comando non autorizzato' });
+    io.to(session.baby.socketId).emit('talkback:state', { parentId: parent.id, enabled });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('baby-mic:set', ({ enabled } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    const parent = authenticatedParent(socket, session);
+    if (!parent || !session.baby.socketId || typeof enabled !== 'boolean') return callback(ack, { ok: false, error: 'Comando non autorizzato' });
+    io.to(session.baby.socketId).emit('baby-mic:set', { enabled, requestedBy: parent.id });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('baby-mic:state', ({ enabled } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    if (!session || socket.data.role !== 'baby' || typeof enabled !== 'boolean') return callback(ack, { ok: false, error: 'Stato non autorizzato' });
+    session.babyMicEnabled = enabled;
+    io.to(roomName(session.id)).emit('baby-mic:state', { enabled });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('detector:event', ({ type, level } = {}, ack) => {
+    const session = authenticatedSession(socket);
+    if (!session || socket.data.role !== 'baby' || !['cry', 'motion'].includes(type)) return callback(ack, { ok: false, error: 'Evento non autorizzato' });
+    socket.to(roomName(session.id)).emit('detector:event', { type, level: Number(level) || 0, at: now() });
+    callback(ack, { ok: true });
+  });
+
+  socket.on('disconnect', (reason) => {
+    const session = sessions.get(socket.data.sessionId);
+    if (!session || session.ended) return;
+    if (socket.data.role === 'baby' && session.baby.socketId === socket.id) {
+      session.baby.socketId = null;
+      io.to(roomName(session.id)).emit('baby:offline', { reconnectUntil: now() + RECONNECT_TTL_MS });
+      session.babyOfflineTimer = setTimeout(() => endSession(session, 'baby-offline-timeout'), RECONNECT_TTL_MS + 250);
+      emitPresence(session);
+      return;
+    }
+    if (socket.data.role === 'parent') {
+      const parent = session.parents.get(socket.data.parentId);
+      if (parent && parent.socketId === socket.id) {
+        parent.socketId = null;
+        scheduleParentExpiry(session, parent, reason || 'socket-disconnect');
+      }
+    }
+  });
+});
 
 if (require.main === module) {
-  const { server } = createApplication();
-  server.listen(PORT, '0.0.0.0', () => console.log(`BabyMoon ${VERSION} listening on ${PORT}`));
+  server.listen(PORT, () => console.log(`BabyMoon v1.2.1 listening on http://localhost:${PORT}`));
 }
 
-module.exports = {
-  createApplication,
-  SessionRegistry,
-  SlidingWindowLimiter,
-  constants: { VERSION, MAX_PARENTS, INVITE_TTL_MS, RECONNECT_TTL_MS }
-};
+module.exports = { app, server, io, sessions, constants: { MAX_PARENTS, RECONNECT_TTL_MS, INVITE_TTL_MS } };

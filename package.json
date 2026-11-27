@@ -1,22 +1,26 @@
 {
   "name": "babymoon",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
-  "description": "BabyMoon — baby monitor P2P, multi-Parent e PWA",
+  "description": "BabyMoon private peer-to-peer baby monitor",
   "type": "commonjs",
   "main": "server.js",
+  "engines": { "node": ">=20 <23" },
   "scripts": {
     "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js && node --check public/app.js && node --check public/sw.js",
     "test": "node --test tests/*.test.js",
-    "check": "node --check server.js && node --check public/app.js && node --check public/sw.js && npm test"
-  },
-  "engines": {
-    "node": ">=20"
+    "test:integration": "node --test tests/multi-parent.integration.test.js"
   },
   "dependencies": {
-    "express": "4.21.2",
-    "jsqr": "1.4.0",
-    "qrcode": "1.5.4",
-    "socket.io": "4.8.1"
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
   }
 }
